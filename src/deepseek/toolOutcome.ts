@@ -1,5 +1,5 @@
 /** Normalizes tool-compatible upstream text without exposing protocol garbage. */
-import type { ParsedToolCalls } from "./toolCalls.js";
+import type { ParsedToolCalls, ParseToolHints } from "./toolCalls.js";
 import { parseToolCalls, parseToolCallsFromParts } from "./toolCalls.js";
 
 export const EMPTY_TOOL_RESPONSE_TEXT =
@@ -20,8 +20,9 @@ export function resolveToolTurn(
   reasoningText: string,
   idSeed: string,
   emptyFallback = "",
+  hints: ParseToolHints = {},
 ): ToolTurnOutcome {
-  const parsed = parseToolCallsFromParts(outputText, reasoningText, idSeed);
+  const parsed = parseToolCallsFromParts(outputText, reasoningText, idSeed, hints);
   let content = parsed.content;
   let promotedReasoning = false;
 

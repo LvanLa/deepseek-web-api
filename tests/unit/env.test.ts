@@ -13,14 +13,19 @@ function temporaryCwd(): string {
 }
 
 describe("loadConfig DS_TOOL_REASONING", () => {
-  it("defaults to hidden", () => {
+  it("defaults to raw so agent thinking is visible", () => {
     vi.stubEnv("DS_TOOL_REASONING", "");
-    expect(loadConfig(temporaryCwd()).toolReasoning).toBe("hidden");
+    expect(loadConfig(temporaryCwd()).toolReasoning).toBe("raw");
   });
 
   it("accepts clean", () => {
     vi.stubEnv("DS_TOOL_REASONING", "clean");
     expect(loadConfig(temporaryCwd()).toolReasoning).toBe("clean");
+  });
+
+  it("accepts hidden", () => {
+    vi.stubEnv("DS_TOOL_REASONING", "hidden");
+    expect(loadConfig(temporaryCwd()).toolReasoning).toBe("hidden");
   });
 
   it("rejects invalid values", () => {

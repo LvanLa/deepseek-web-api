@@ -303,3 +303,280 @@ ${FAILED_SESSION_A}`);
     ).toEqual({ content: "", toolCalls: [] });
   });
 });
+
+describe("parseToolCalls DSML native protocol", () => {
+  const webRunCode = `<｜｜DSML｜｜calls>
+<｜｜DSML｜｜ invoke name="run_code">
+<｜｜DSML｜｜ parameter name="code" string="true">const top = await tools.pwsh({ command: "Get-ChildItem -Force -Name" });
+console.log(top);</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name="description" string="true">Inspect backend project layout</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>`;
+
+  it("parses the double-bar spaced web stanza (run_code) into a function call", () => {
+    const result = parseToolCalls(webRunCode, "seed");
+
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("run_code");
+    expect(JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}")).toEqual({
+      code: 'const top = await tools.pwsh({ command: "Get-ChildItem -Force -Name" });\nconsole.log(top);',
+      description: "Inspect backend project layout",
+    });
+  });
+
+  it("parses single-bar tool_calls with typed string and JSON parameters", () => {
+    const stanza = [
+      "<｜DSML｜tool_calls>",
+      '<｜DSML｜invoke name="set_count">',
+      '<｜DSML｜parameter name="count" string="false">42</｜DSML｜parameter>',
+      '<｜DSML｜parameter name="enabled" string="false">true</｜DSML｜parameter>',
+      '<｜DSML｜parameter name="label" string="true">ok</｜DSML｜parameter>',
+      '<｜DSML｜parameter name="options" string="false">{"nested":[1,2]}</｜DSML｜parameter>',
+      "</｜DSML｜invoke>",
+      "</｜DSML｜tool_calls>",
+    ].join("");
+
+    const result = parseToolCalls(stanza, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}")).toEqual({
+      count: 42,
+      enabled: true,
+      label: "ok",
+      options: { nested: [1, 2] },
+    });
+  });
+
+  it("keeps prose around a DSML stanza and emits multiple invokes in order", () => {
+    const stanza = `Running it now.
+<｜｜DSML｜｜calls>
+<｜｜DSML｜｜invoke name="bash"><｜｜DSML｜｜parameter name="command" string="true">ls</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>
+<｜｜DSML｜｜invoke name="read"><｜｜DSML｜｜parameter name="path" string="true">README.md</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>
+</｜｜DSML｜｜calls>
+Done setup.`;
+
+    const result = parseToolCalls(stanza, "seed");
+    expect(result.content).toBe("Running it now.\n\nDone setup.");
+    expect(result.toolCalls.map((call) => call.function.name)).toEqual(["bash", "read"]);
+  });
+
+  it("unescapes closing parameter tags inside string bodies", () => {
+    const stanza =
+      '<｜｜DSML｜｜invoke name="run_code">' +
+      '<｜｜DSML｜｜parameter name="code" string="true">' +
+      "a&lt;/｜｜DSML｜｜parameter>b&amp;lt;/｜｜DSML｜｜parameter>c" +
+      "</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>";
+
+    const result = parseToolCalls(stanza, "seed");
+    expect(result.content).toBe("");
+    expect(JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}")).toEqual({
+      code: "a</｜｜DSML｜｜parameter>b&lt;/｜｜DSML｜｜parameter>c",
+    });
+  });
+
+  it("does not harvest JSON inside DSML parameters as extra bare calls", () => {
+    const stanza = `<｜DSML｜tool_calls>
+<｜DSML｜invoke name="read">
+<｜DSML｜parameter name="query" string="false">
+{"name":"bash","arguments":{"command":"ls"}}
+</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>`;
+
+    const result = parseToolCalls(stanza, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls.map((call) => call.function.name)).toEqual(["read"]);
+    expect(JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}")).toEqual({
+      query: { name: "bash", arguments: { command: "ls" } },
+    });
+  });
+
+  it("repairs an unclosed DSML stanza truncated at end of output", () => {
+    const result = parseToolCalls(
+      '<｜｜DSML｜｜invoke name="read"><｜｜DSML｜｜parameter name="path" string="true">README.md',
+      "seed",
+    );
+    expect(result.content).toBe("");
+    expect(result.toolCalls[0]?.function).toEqual({
+      name: "read",
+      arguments: '{"path":"README.md"}',
+    });
+  });
+
+  it("strips nameless DSML protocol garbage while preserving surrounding prose", () => {
+    const stanza =
+      "Before.\n" +
+      '<｜｜DSML｜｜invoke><｜｜DSML｜｜parameter name="x" string="true">y</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>';
+
+    expect(parseToolCalls(stanza, "seed")).toEqual({ content: "Before.", toolCalls: [] });
+    expect(parseToolCalls(stanza.replace("Before.\n", ""), "seed")).toEqual({
+      content: "",
+      toolCalls: [],
+    });
+  });
+
+  it("promotes DSML calls leaked into reasoning and canonicalizes to <tool_call>", () => {
+    const result = parseToolCallsFromParts("", webRunCode, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("run_code");
+    expect(canonicalParsedAssistantText(result)).toBe(
+      '<tool_call>\n{"arguments":{"code":"const top = await tools.pwsh({ command: \\"Get-ChildItem -Force -Name\\" });\\nconsole.log(top);","description":"Inspect backend project layout"},"name":"run_code"}\n</tool_call>',
+    );
+  });
+
+  it("deduplicates the same call emitted once as DSML and once as <tool_call>", () => {
+    const mixed =
+      webRunCode +
+      '\n<tool_call>\n{"name":"run_code","arguments":{"description":"Inspect backend project layout","code":"const top = await tools.pwsh({ command: \\"Get-ChildItem -Force -Name\\" });\\nconsole.log(top);"}}\n</tool_call>';
+
+    const result = parseToolCalls(mixed, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("run_code");
+  });
+
+  it("strips the mangled ASCII < calls> wrapper seen in real web output", () => {
+    const real = `< calls> <｜｜DSML｜｜ invoke name="run_code"> <｜｜DSML｜｜ parameter name="code" string="true">const x = 1;</｜｜DSML｜｜ parameter> <｜｜DSML｜｜ parameter name="description" string="true">List backend tree</｜｜DSML｜｜ parameter> </｜｜DSML｜｜ invoke> </｜｜DSML｜｜ calls>`;
+    const result = parseToolCalls(real, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("run_code");
+    expect(canonicalAssistantText(real)).not.toContain("< calls>");
+    expect(canonicalAssistantText(real)).toContain("<tool_call>");
+  });
+
+  it("treats a lone residue wrapper as protocol-only output", () => {
+    expect(parseToolCalls("< calls>", "seed")).toEqual({ content: "", toolCalls: [] });
+    expect(parseToolCalls("  </tool_calls> ", "seed")).toEqual({ content: "", toolCalls: [] });
+  });
+
+  it("strips residue prefixing an ordinary <tool_call> block", () => {
+    const text =
+      '< calls> <tool_call>\n{"name":"bash","arguments":{"command":"ls"}}\n</tool_call>';
+    const result = parseToolCalls(text, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls[0]?.function.name).toBe("bash");
+  });
+
+  it("keeps prose that merely mentions a calls-like token", () => {
+    const text = "The function calls> helper is unrelated to tooling.";
+    expect(parseToolCalls(text, "seed")).toEqual({ content: text, toolCalls: [] });
+  });
+
+  it("recovers an unwrapped shell command object without name or arguments keys", () => {
+    const body = '{"command":"npx --yes typescript@5.4.5 tsc --noEmit","blocking":true,' +
+      '"command_type":"short_running_process",' +
+      '"cwd":"f:\\\\workspace\\\\play-together\\\\miniprogram","requires_approval":false}';
+    const closed = `<tool_call>\n${body}\n</tool_call>`;
+    const result = parseToolCalls(closed, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("bash");
+    expect(JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}")).toEqual({
+      command: "npx --yes typescript@5.4.5 tsc --noEmit",
+      cwd: "f:\\workspace\\play-together\\miniprogram",
+    });
+
+    // The same object truncated without a close tag is recovered at flush.
+    const unclosed = `<tool_call>\n${body}`;
+    const repaired = parseToolCalls(unclosed, "seed");
+    expect(repaired.content).toBe("");
+    expect(repaired.toolCalls[0]?.function.name).toBe("bash");
+  });
+
+  it("does not treat a command-less object as a shell call", () => {
+    const text = '<tool_call>\n{"city":"Hefei"}\n</tool_call>';
+    const result = parseToolCalls(text, "seed");
+    expect(result.toolCalls).toEqual([]);
+  });
+
+  it("infers an omitted name from registered parameter keys", () => {
+    const body = String.raw`{"arguments":{"pattern":"Options<","path":"f:\workspace\x","glob":"*.d.ts","output_mode":"content","-n":true,"head_limit":40}}`;
+    const sample = `<_call>\n${body}\n</tool_call>\n</｜｜DSML｜｜ calls>`;
+    const tools = [
+      { name: "Glob", paramKeys: ["pattern", "path", "glob"] },
+      { name: "Grep", paramKeys: ["pattern", "path", "glob", "output_mode", "-n", "head_limit"] },
+      { name: "Read", paramKeys: ["file_path"] },
+    ];
+    const result = parseToolCalls(sample, "seed", { tools });
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("Grep");
+    const args = JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}") as { path: string };
+    expect(args.path).toBe(String.raw`f:\workspace\x`);
+  });
+
+  it("does not infer a name when two tools explain every key", () => {
+    const text = '<tool_call>\n{"arguments":{"pattern":"x"}}\n</tool_call>';
+    const tools = [
+      { name: "A", paramKeys: ["pattern"] },
+      { name: "B", paramKeys: ["pattern"] },
+    ];
+    expect(parseToolCalls(text, "seed", { tools }).toolCalls).toEqual([]);
+  });
+
+  it("recovers orphan parameters missing invoke openers or shifted close tags", () => {
+    const base = "f:\\workspace\\play-together\\miniprogram\\pages\\";
+    const orphanInvokeClose = (file: string): string =>
+      `<｜｜DSML｜｜ parameter name="file_path" string="true">${base}${file}</｜｜DSML｜｜ invoke>`;
+    const orphanParameter = (file: string): string =>
+      `<｜｜DSML｜｜ parameter name="file_path" string="true">${base}${file}</｜｜DSML｜｜ parameter>`;
+    const stanza = [
+      "<｜｜DSML｜｜ calls>",
+      '<｜｜DSML｜｜ invoke name="Read">',
+      orphanParameter("home\\home.ts"),
+      "</｜｜DSML｜｜ invoke>",
+      orphanInvokeClose("setup\\setup.ts"),
+      orphanInvokeClose("setup\\setup.wxml"),
+      orphanParameter("activity\\activity.ts"),
+      "</｜｜DSML｜｜ parameter>",
+      orphanParameter("activity\\activity.wxml"),
+      "</｜｜DSML｜｜ parameter>",
+      '<｜｜DSML｜｜ invoke name="Read">',
+      orphanParameter("session\\session.ts"),
+      "</｜｜DSML｜｜ parameter>",
+      "</｜｜DSML｜｜ invoke>",
+      orphanInvokeClose("session\\session.wxml"),
+      '<｜｜DSML｜｜ invoke name="Read">',
+      orphanParameter("complete\\complete.ts"),
+      "</｜｜DSML｜｜ parameter>",
+      "</｜｜DSML｜｜ invoke>",
+      orphanInvokeClose("complete\\complete.wxml"),
+      '<｜｜DSML｜｜ invoke name="Read">',
+      orphanParameter("memory\\memory.ts"),
+      "</｜｜DSML｜｜ parameter>",
+      "</｜｜DSML｜｜ invoke>",
+      orphanInvokeClose("memory\\memory.wxml"),
+      '<｜｜DSML｜｜ invoke name="Read">',
+      orphanParameter("memories\\memories.ts"),
+      "</｜｜DSML｜｜ parameter>",
+      "</｜｜DSML｜｜ invoke>",
+      orphanInvokeClose("memories\\memories.wxml"),
+      "</｜｜DSML｜｜ calls>",
+    ].join("\n");
+
+    const result = parseToolCalls(stanza, "seed");
+    expect(result.content).toBe("");
+    const files = result.toolCalls.map((call) => {
+      expect(call.function.name).toBe("Read");
+      return JSON.parse(call.function.arguments).file_path;
+    });
+    expect(files).toEqual([
+      `${base}home\\home.ts`,
+      `${base}setup\\setup.ts`,
+      `${base}setup\\setup.wxml`,
+      `${base}activity\\activity.ts`,
+      `${base}activity\\activity.wxml`,
+      `${base}session\\session.ts`,
+      `${base}session\\session.wxml`,
+      `${base}complete\\complete.ts`,
+      `${base}complete\\complete.wxml`,
+      `${base}memory\\memory.ts`,
+      `${base}memory\\memory.wxml`,
+      `${base}memories\\memories.ts`,
+      `${base}memories\\memories.wxml`,
+    ]);
+  });
+});

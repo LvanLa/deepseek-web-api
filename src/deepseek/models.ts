@@ -4,6 +4,7 @@ import { isRecord } from "../utils/json.js";
 
 const MODEL_MAP: Readonly<Record<string, ModelType>> = {
   "deepseek-v4-flash": "default",
+  "deepseek-v4.1-flash": "default",
   "deepseek-v4-pro": "expert",
   "deepseek-chat": "default",
   "deepseek-reasoner": "expert",
@@ -17,8 +18,11 @@ export function resolveModel(body: RequestBody): ModelResolution {
   const raw = String(body.model || "deepseek-v4-flash").toLowerCase();
   const inferred: ModelType = raw.includes("pro") || raw.includes("expert") ? "expert" : "default";
   const modelType = MODEL_MAP[raw] ?? inferred;
-  const publicModel: PublicModel =
-    modelType === "expert" ? "deepseek-v4-pro" : "deepseek-v4-flash";
+  const publicModel: PublicModel = raw === "deepseek-v4.1-flash"
+    ? "deepseek-v4.1-flash"
+    : modelType === "expert"
+      ? "deepseek-v4-pro"
+      : "deepseek-v4-flash";
   return { raw, modelType, publicModel };
 }
 

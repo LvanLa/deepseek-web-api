@@ -19,6 +19,16 @@ function parseObject(text: string): unknown | null {
   }
 }
 
+/**
+ * Parse JSON tolerating single backslashes in Windows paths (for example
+ * "f:\workspace\f"). Only attempted after a strict failure when a drive
+ * prefix is present; doubling every backslash restores literal separators.
+ */
+function lenientObject(text: string): unknown | null {
+  if (!/[A-Za-z]:[\\/]/.test(text)) return null;
+  return parseObject(text.replace(/\\/g, "\\\\"));
+}
+
 function scanClosers(text: string): { end: number | null; missing: string[] | null } {
   const closers: string[] = [];
   let inString = false;
@@ -52,15 +62,19 @@ function withoutTrailingCommas(text: string): string {
 export function repairJson(raw: string): unknown | null {
   const text = raw.trim();
   if (!text.startsWith("{")) return null;
-  const direct = parseObject(text);
+  const direct = parseObject(text) ?? lenientObject(text);
   if (direct) return direct;
 
   const scan = scanClosers(text);
-  if (scan.end !== null) return parseObject(withoutTrailingCommas(text.slice(0, scan.end)));
+  if (scan.end !== null) {
+    const complete = withoutTrailingCommas(text.slice(0, scan.end));
+    return parseObject(complete) ?? lenientObject(complete);
+  }
   if (!scan.missing || scan.missing.length === 0 || scan.missing.length > MAX_MISSING_CLOSERS) {
     return null;
   }
-  return parseObject(withoutTrailingCommas(text) + scan.missing.join(""));
+  const repaired = withoutTrailingCommas(text) + scan.missing.join("");
+  return parseObject(repaired) ?? lenientObject(repaired);
 }
 
 function isStandaloneStart(text: string, index: number): boolean {

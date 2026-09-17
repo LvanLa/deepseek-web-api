@@ -1,6 +1,6 @@
 /** Core boundary types shared across model resolution, sessions, and streaming. */
 export type ModelType = "default" | "expert";
-export type PublicModel = "deepseek-v4-flash" | "deepseek-v4-pro";
+export type PublicModel = "deepseek-v4-flash" | "deepseek-v4.1-flash" | "deepseek-v4-pro";
 
 export interface ModelResolution {
   raw: string;

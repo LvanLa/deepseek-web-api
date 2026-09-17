@@ -4,6 +4,8 @@ export type ResponseEmitter = (event: string, data: Record<string, unknown>) => 
 export class ResponseEventWriter {
   reasoningOpened = false;
   messageOpened = false;
+  reasoningFinished = false;
+  messageFinished = false;
   private sequence = 0;
 
   constructor(
@@ -22,6 +24,7 @@ export class ResponseEventWriter {
   }
 
   emitReasoningDelta(delta: string): void {
+    if (this.reasoningFinished) return;
     this.ensureReasoning();
     this.emit("response.reasoning_text.delta", {
       type: "response.reasoning_text.delta",
@@ -33,6 +36,7 @@ export class ResponseEventWriter {
   }
 
   emitOutputDelta(delta: string): void {
+    if (this.messageFinished) return;
     this.ensureMessage();
     this.emit("response.output_text.delta", {
       type: "response.output_text.delta",
@@ -43,8 +47,19 @@ export class ResponseEventWriter {
     });
   }
 
+  /** Close any open reasoning/message items before a later item (tool call) commits. */
+  finishOpenItems(
+    reasoningText: string,
+    messageText: string,
+    output: Array<Record<string, unknown>>,
+  ): void {
+    if (this.reasoningOpened && !this.reasoningFinished) this.finishReasoning(reasoningText, output);
+    if (this.messageOpened && !this.messageFinished) this.finishMessage(messageText, output);
+  }
+
   finishReasoning(text: string, output: Array<Record<string, unknown>>): void {
-    if (!this.reasoningOpened) return;
+    if (!this.reasoningOpened || this.reasoningFinished) return;
+    this.reasoningFinished = true;
     this.emit("response.reasoning_text.done", {
       type: "response.reasoning_text.done",
       item_id: this.reasoningId,
@@ -67,7 +82,8 @@ export class ResponseEventWriter {
   }
 
   finishMessage(text: string, output: Array<Record<string, unknown>>): void {
-    if (!this.messageOpened) return;
+    if (!this.messageOpened || this.messageFinished) return;
+    this.messageFinished = true;
     const outputIndex = output.length;
     this.emit("response.output_text.done", {
       type: "response.output_text.done",

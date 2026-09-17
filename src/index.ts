@@ -32,15 +32,15 @@ async function buildRuntime() {
   const login = new LoginManager(chrome, config, logger);
   const sessions = new SessionStore(config.sessionsFile, logger);
   const client = new DeepSeekClient(config, login, sessions, logger);
-  return { config, logger, client };
+  return { config, logger, client, sessions };
 }
 
 /** Validate login before listening so the first API request is immediately usable. */
 async function start(): Promise<void> {
-  const { config, logger, client } = await buildRuntime();
+  const { config, logger, client, sessions } = await buildRuntime();
   const apiKey = loadApiKey(config.apiKeyFile);
   await client.initialize();
-  const server = createServer({ client, apiKeys: apiKey.keys, debug: config.debug });
+  const server = createServer({ client, apiKeys: apiKey.keys, debug: config.debug, logger });
   await listen(server, config.port, config.host);
   logger.info(`deepseek-web-api 已启动：http://${config.host}:${config.port}`);
   logger.info("路由：POST /v1/responses、POST /v1/chat/completions、GET /v1/models、GET /health");
@@ -49,7 +49,10 @@ async function start(): Promise<void> {
 
   const shutdown = (signal: string): void => {
     logger.info(`收到 ${signal}，正在停止服务`);
-    server.close(() => process.exit(0));
+    server.close(() => {
+      sessions.close();
+      process.exit(0);
+    });
   };
   process.once("SIGINT", () => shutdown("SIGINT"));
   process.once("SIGTERM", () => shutdown("SIGTERM"));
@@ -57,8 +60,9 @@ async function start(): Promise<void> {
 
 /** Ensure browser authentication and exit after refreshing data/auth.json. */
 async function login(): Promise<void> {
-  const { config, logger, client } = await buildRuntime();
+  const { config, logger, client, sessions } = await buildRuntime();
   await client.initialize();
+  sessions.close();
   logger.info("认证信息已写入", { file: config.authFile });
 }
 

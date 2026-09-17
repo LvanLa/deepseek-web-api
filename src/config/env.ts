@@ -8,7 +8,7 @@ import {
   DEEPSEEK_BASE_URL,
 } from "./constants.js";
 
-export type ToolReasoningMode = "hidden" | "clean";
+export type ToolReasoningMode = "hidden" | "clean" | "raw";
 
 export interface AppConfig {
   port: number;
@@ -55,9 +55,11 @@ function envPath(name: string, fallback: string): string {
 }
 
 function parseToolReasoning(raw: string | undefined): ToolReasoningMode {
-  const value = raw?.trim() || "hidden";
-  if (value !== "hidden" && value !== "clean") {
-    throw new Error(`Invalid DS_TOOL_REASONING: ${value}; expected hidden or clean`);
+  const value = raw?.trim() || "raw";
+  if (value !== "hidden" && value !== "clean" && value !== "raw") {
+    throw new Error(
+      `Invalid DS_TOOL_REASONING: ${value}; expected hidden, clean or raw`,
+    );
   }
   return value;
 }

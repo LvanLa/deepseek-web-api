@@ -22,9 +22,9 @@
 - `THINK` → Responses reasoning / Chat `reasoning_content`
 - `RESPONSE` → Responses output text / Chat content
 - API key 保护全部 `/v1/*` 路由
-- DeepSeek session 与 `parent_message_id` 持久化；切换 flash/pro 或 thinking 不主动分叉
+- DeepSeek session 与 `parent_message_id` 持久化；保存完整展开历史并按折叠指纹匹配，切换 flash/pro 或 thinking、工具轮之后都不主动分叉
 - system/developer/AGENTS/skills、工具 schema、assistant/tool 历史的 prompt 兼容
-- 文本工具协议 → Chat `tool_calls` / Responses `function_call`
+- 文本工具协议 → Chat `tool_calls` / Responses `function_call`；容忍真实模型输出的松散标签、DSML 包装和转义错误的 Windows 路径
 - Pi `openai-completions` 与 `openai-responses` 配置示例
 
 ## 前置要求
@@ -174,7 +174,9 @@ Responses 路径、thinking level、AGENTS.md/skills、MCP-backed tools、tool-c
 2. 传回 `conversation` / `chat_session_id`；
 3. 像 Pi 一样发送完整稳定历史，由 `SessionStore` 匹配。
 
-服务端保存 DeepSeek session 和最后一个可信 `response_message_id`。切换公开模型或 thinking 开关时，只要历史或显式 ID 匹配，就继续同一 DeepSeek session。
+服务端保存 DeepSeek session 和最后一个可信 `response_message_id`。会话历史按**完整展开形态**落盘（`user → assistant(tool_calls) → tool(result) → assistant`），但匹配指纹会对展开形态做**折叠**：忽略 `tool`/`function` 轮并合并相邻 assistant，因此新版展开历史与旧版单条 canonical 历史都能命中同一 session，旧的 canonical 记录会在下一次对话时自动升级为展开形态。
+
+请求超过 40 轮时按最近的 **user 边界**截断，保证回放历史始终以用户消息开头。切换公开模型或 thinking 开关时，只要历史或显式 ID 匹配，就继续同一 DeepSeek session。
 
 > 同一 session 不支持并发写入。并行请求可能复用同一个 parent 并在上游形成分支。
 
@@ -189,6 +191,13 @@ DeepSeek Web 没有 OpenAI 原生 function calling。本项目把 tools/function
 ```
 
 解析成功后映射为标准结构。工具结果轮也会进入 session/history 匹配。
+
+真实模型输出经常偏离上面的严格格式，解析器会做窄范围恢复，且不会把普通正文误判为调用：
+
+- 接受松散的 ASCII 标签（`tool_call`、`tool-call`、`_call`、`call` 等）和原生 DSML 包装（`<｜｜DSML｜｜ invoke/parameter>`，全角竖线一到两根）。
+- 模型省略 `name`、只给出 `{"arguments":{...}}` 时，用注册工具的 `paramKeys` 唯一匹配推断工具名；两个工具都能解释全部参数时不猜。
+- 严格解析失败且字符串含盘符前缀（如 `f:\workspace\...`）时，按 Windows 单反斜杠转义错误重试一次，修复后被丢弃的调用可以正常恢复。
+- 流式过程中跨 chunk 的标签、孤立闭合标签和残缺 DSML 片段会被隐藏，不会以原始协议文本下发给客户端。
 
 这仍是**提示词模拟**：不能保证模型一定调用工具、严格遵守 JSON Schema 或正确并行调用。带工具的流式请求可能在尾部集中输出结构化 call，因为服务必须先清理协议文本。
 
@@ -210,7 +219,7 @@ DeepSeek Web 没有 OpenAI 原生 function calling。本项目把 tools/function
 | `DS_POW_JS` | 内置当前 worker URL | DeepSeekHashV1 worker chunk URL |
 | `DS_BASE_URL` | `https://chat.deepseek.com` | 上游地址，主要用于调试 |
 | `DS_DEBUG` | `false` | 增加调试日志和 HTTP error stack |
-| `DS_TOOL_REASONING` | `hidden` | 工具轮 reasoning：`hidden` 或 `clean` |
+| `DS_TOOL_REASONING` | `raw` | 工具轮思考可见性：`raw`（实时下发原始思考）、`clean`（实时下发并剔除泄漏的工具标签）、`hidden`（不下发，纯思考轮提升为正文） |
 
 可复制 `.env.example` 为 `.env`。启动时读取该文件，但不会覆盖已存在的进程环境变量。
 
@@ -279,4 +288,4 @@ CI 在 Node.js 20 和 22 上执行相同检查。单元测试不访问真实 Dee
 
 ## License
 
-[MIT](LICENSE) © 2026 kittors
+[MIT](LICENSE) © 2026 lvanla

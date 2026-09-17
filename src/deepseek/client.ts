@@ -2,12 +2,14 @@
 import type { LoginManager } from "../browser/login.js";
 import type { AppConfig } from "../config/env.js";
 import { HttpError } from "../utils/errors.js";
+import { isRecord } from "../utils/json.js";
 import type { Logger } from "../utils/logger.js";
 import {
-  consumeToolChat,
-  emitToolChat,
+  finalChunk,
   streamPlainChat,
+  streamToolChat,
   toolDiagnostics,
+  toolSessionText,
   type ChatRun,
   type ChatStreamChunk,
 } from "./chatStream.js";
@@ -22,31 +24,19 @@ import { resolveModel, resolveSearch, resolveThinking } from "./models.js";
 import { prepareCompletion } from "./pow.js";
 import { buildDeepSeekPrompt, buildToolRecoveryPrompt } from "./promptBuild.js";
 import type { MessageId, SessionStore } from "./sessionStore.js";
-import { canonicalAssistantText } from "./toolCalls.js";
 import { EMPTY_TOOL_RESPONSE_TEXT } from "./toolOutcome.js";
 import type { MessageTurn, ModelType, RequestBody } from "./types.js";
 
 interface PreparedRun extends ChatRun {
-  prompt: string;
-  parentMessageId: MessageId;
-  modelType: ModelType;
-  thinking: boolean;
-  search: boolean;
-  reusedSession: boolean;
-  convKey: string | null;
-  requestTurns: MessageTurn[];
-  instructionFingerprint: string;
-  toolsFingerprint: string;
-  latestUserText: string;
-  hasTools: boolean;
-  retry: number;
+  prompt: string; parentMessageId: MessageId; modelType: ModelType;
+  thinking: boolean; search: boolean; reusedSession: boolean;
+  convKey: string | null; requestTurns: MessageTurn[]; allTurns: MessageTurn[];
+  instructionFingerprint: string; toolsFingerprint: string;
+  latestUserText: string; hasTools: boolean; retry: number;
 }
-interface CompletionAttempt<T> { value: T; diagnostics: CompletionDiagnostics }
+
+interface CompletionAttempt<T> { value: T; diagnostics: CompletionDiagnostics; framesEmitted?: number }
 interface CompletionResult<T> extends CompletionAttempt<T> { run: PreparedRun; retry: number }
-interface BufferedResponse {
-  result: MappedResponseResult;
-  events: Array<{ event: string; data: Record<string, unknown> }>;
-}
 export type { ChatStreamChunk } from "./chatStream.js";
 
 export class DeepSeekClient {
@@ -75,15 +65,18 @@ export class DeepSeekClient {
     }
 
     const completed = await this.withToolRecovery(body, initialRun, async (run, _retry, final) => {
-      const events: BufferedResponse["events"] = [];
       const result = await consumeResponses({
         ...this.responseInput(run),
         emptyToolResponseText: final ? EMPTY_TOOL_RESPONSE_TEXT : "",
-        emit: (event, data) => events.push({ event, data }),
+        ...(emit ? { emit } : {}),
       });
-      return { value: { result, events }, diagnostics: result.diagnostics };
+      return {
+        value: { result },
+        diagnostics: result.diagnostics,
+        framesEmitted: result.framesEmitted,
+      };
     });
-    for (const event of completed.value.events) emit?.(event.event, event.data);
+
     if (!completed.diagnostics.recoverableEmpty) {
       this.remember(
         completed.run,
@@ -105,17 +98,21 @@ export class DeepSeekClient {
     }
 
     const completed = await this.withToolRecovery(body, initialRun, async (run, _retry, final) => {
-      const value = await consumeToolChat(run, final ? EMPTY_TOOL_RESPONSE_TEXT : "");
-      return { value, diagnostics: toolDiagnostics(value.outcome) };
+      const value = await streamToolChat(
+        run,
+        this.config.toolReasoning,
+        final ? EMPTY_TOOL_RESPONSE_TEXT : "",
+        emit,
+      );
+      return { value, diagnostics: toolDiagnostics(value.outcome), framesEmitted: value.framesEmitted };
     });
-    const sessionText = emitToolChat(
-      completed.run,
-      completed.value,
-      this.config.toolReasoning,
-      emit,
-    );
+    emit(finalChunk(completed.run, Math.floor(Date.now() / 1000), completed.value.finishReason));
     if (!completed.diagnostics.recoverableEmpty) {
-      this.remember(completed.run, completed.value.responseMessageId, sessionText);
+      this.remember(
+        completed.run,
+        completed.value.responseMessageId,
+        toolSessionText(completed.value.outcome),
+      );
     }
   }
 
@@ -130,10 +127,14 @@ export class DeepSeekClient {
   ): Promise<CompletionResult<T>> {
     const first = await execute(initialRun, 0, false);
     this.logAttempt(initialRun, first.diagnostics);
-    if (!first.diagnostics.recoverableEmpty) return { ...first, run: initialRun, retry: 0 };
+    // Once deltas streamed to the client they cannot be taken back, so a live
+    // turn with any emitted frame is never silently retried.
+    if (!first.diagnostics.recoverableEmpty || (first.framesEmitted ?? 0) > 0) {
+      return { ...first, run: initialRun, retry: 0 };
+    }
 
     this.logger.info("Retrying unusable DeepSeek tool response", this.logFields(initialRun, first.diagnostics));
-    const retryRun = await this.prepare(body, initialRun);
+    const retryRun = await this.prepare(body, initialRun, this.retryParentId(first.value));
     const second = await execute(retryRun, 1, true);
     this.logAttempt(retryRun, second.diagnostics);
     if (second.diagnostics.recoverableEmpty) {
@@ -148,7 +149,11 @@ export class DeepSeekClient {
   }
 
   /** Resolve trusted request options and preserve the last good parent across an empty retry. */
-  private async prepare(body: RequestBody, retryFrom?: PreparedRun): Promise<PreparedRun> {
+  private async prepare(
+    body: RequestBody,
+    retryFrom?: PreparedRun,
+    retryParent: MessageId = null,
+  ): Promise<PreparedRun> {
     const { modelType, publicModel } = resolveModel(body);
     const thinking = resolveThinking(body);
     const search = resolveSearch(body, modelType);
@@ -174,11 +179,16 @@ export class DeepSeekClient {
       powWorkerUrl: this.config.powWorkerUrl,
       modelType,
       fallbackToken: auth.token,
-      sessionId: retryFrom ? null : reusedSession ? conversation?.sessionId ?? null : null,
-      reuseSession: retryFrom ? false : reusedSession,
+      // A retry stays in the original upstream session instead of orphaning it.
+      sessionId: retryFrom
+        ? retryFrom.sessionId
+        : reusedSession
+          ? conversation?.sessionId ?? null
+          : null,
+      reuseSession: retryFrom ? true : reusedSession,
     });
     const parentMessageId = retryFrom
-      ? null
+      ? retryParent
       : reusedSession
         ? conversation?.parentMessageId ?? this.sessions.get(prepared.sessionId)?.lastResponseMessageId ?? null
         : null;
@@ -204,6 +214,7 @@ export class DeepSeekClient {
       thinking,
       search,
     });
+    const carried = retryFrom ?? built;
     return {
       upstream,
       prompt,
@@ -217,27 +228,21 @@ export class DeepSeekClient {
       convKey: retryFrom
         ? retryFrom.convKey
         : conversation?.key ?? conversation?.pendingFingerprint ?? null,
-      requestTurns: retryFrom ? retryFrom.requestTurns : built?.requestTurns ?? [],
-      instructionFingerprint: retryFrom
-        ? retryFrom.instructionFingerprint
-        : built?.instructionFingerprint ?? "",
-      toolsFingerprint: retryFrom ? retryFrom.toolsFingerprint : built?.toolsFingerprint ?? "",
-      latestUserText: retryFrom ? retryFrom.latestUserText : built?.latestUserText ?? "",
-      hasTools: retryFrom ? retryFrom.hasTools : built?.hasTools ?? false,
+      requestTurns: carried?.requestTurns ?? [],
+      allTurns: carried?.allTurns ?? [],
+      instructionFingerprint: carried?.instructionFingerprint ?? "",
+      toolsFingerprint: carried?.toolsFingerprint ?? "", latestUserText: carried?.latestUserText ?? "",
+      hasTools: carried?.hasTools ?? false, toolHints: carried?.toolHints ?? [],
       retry,
     };
   }
 
   private responseInput(run: PreparedRun) {
     return {
-      upstream: run.upstream,
-      publicModel: run.publicModel,
-      modelType: run.modelType,
-      sessionId: run.sessionId,
-      thinkingEnabled: run.thinking,
-      searchEnabled: run.search,
-      toolCompatibilityEnabled: run.hasTools,
-      toolReasoning: this.config.toolReasoning,
+      upstream: run.upstream, publicModel: run.publicModel, modelType: run.modelType,
+      sessionId: run.sessionId, thinkingEnabled: run.thinking, searchEnabled: run.search,
+      toolCompatibilityEnabled: run.hasTools, toolReasoning: this.config.toolReasoning,
+      toolHints: run.toolHints,
     };
   }
 
@@ -255,36 +260,35 @@ export class DeepSeekClient {
 
   private logFields(run: PreparedRun, diagnostics: CompletionDiagnostics): Record<string, unknown> {
     return {
-      sessionId: run.sessionId,
-      reused: run.reusedSession,
-      parentMessageId: run.parentMessageId,
-      promptChars: run.prompt.length,
-      reasoningChars: diagnostics.reasoningChars,
-      outputChars: diagnostics.outputChars,
-      toolCallCount: diagnostics.toolCallCount,
-      emptyUpstream: diagnostics.emptyUpstream,
-      retry: run.retry,
+      sessionId: run.sessionId, reused: run.reusedSession, parentMessageId: run.parentMessageId,
+      promptChars: run.prompt.length, retry: run.retry,
+      reasoningChars: diagnostics.reasoningChars, outputChars: diagnostics.outputChars,
+      toolCallCount: diagnostics.toolCallCount, emptyUpstream: diagnostics.emptyUpstream,
     };
   }
 
+  /** Extract the upstream response id used to chain a silent empty-turn retry. */
+  private retryParentId(value: unknown): MessageId {
+    const source = isRecord(value) && isRecord(value.result) ? value.result : value;
+    return isRecord(source) &&
+      (typeof source.responseMessageId === "string" || typeof source.responseMessageId === "number")
+      ? source.responseMessageId
+      : null;
+  }
+
   private remember(run: PreparedRun, responseMessageId: MessageId, responseText: string): void {
-    const canonical = canonicalAssistantText(responseText);
-    if (!canonical.trim()) {
-      this.logger.warn("Skipping empty assistant response", {
-        sessionId: run.sessionId,
-        responseMessageId,
-        retry: run.retry,
-      });
-      return;
-    }
+    // A trailing assistant turn is replayed history, not a new request turn;
+    // exclude it so the new response is not stored as a second assistant.
+    const fullTurns = run.allTurns.at(-1)?.role === "assistant"
+      ? run.allTurns.slice(0, -1)
+      : run.allTurns;
     this.sessions.remember({
       sessionId: run.sessionId,
       modelType: run.modelType,
       responseMessageId,
       convKey: run.convKey,
-      prompt: run.prompt,
-      responseText: canonical,
-      requestTurns: run.requestTurns,
+      fullTurns,
+      assistantContent: responseText,
       instructionFingerprint: run.instructionFingerprint,
       toolsFingerprint: run.toolsFingerprint,
     });

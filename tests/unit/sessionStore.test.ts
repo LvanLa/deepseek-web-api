@@ -1,18 +1,41 @@
 /** Verifies the documented behavior of the corresponding production module. */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { SessionStore } from "../../src/deepseek/sessionStore.js";
 import { canonicalAssistantText } from "../../src/deepseek/toolCalls.js";
+import type { MessageTurn } from "../../src/deepseek/types.js";
+
+function remember(
+  store: SessionStore,
+  sessionId: string,
+  fullTurns: MessageTurn[],
+  assistantContent: string,
+  extras: { modelType?: "default" | "expert"; responseMessageId?: MessageIdLike; convKey?: string } = {},
+): void {
+  store.remember({
+    sessionId,
+    modelType: extras.modelType ?? "default",
+    responseMessageId: extras.responseMessageId ?? 1,
+    ...(extras.convKey ? { convKey: extras.convKey } : {}),
+    fullTurns,
+    assistantContent,
+  });
+}
+
+type MessageIdLike = string | number;
+
+const block = (name: string, args: unknown): string =>
+  canonicalAssistantText(`<tool_call>\n{"name":"${name}","arguments":${JSON.stringify(args)}}\n</tool_call>`);
 
 describe("SessionStore", () => {
   it("does not persist or advance a session for an empty assistant response", () => {
     const store = new SessionStore();
-    store.remember({
-      sessionId: "empty-session",
-      modelType: "expert",
-      responseMessageId: 99,
-      prompt: "inspect",
-      responseText: "   ",
+    remember(store, "empty-session", [{ role: "user", content: "inspect" }], "   ", {
+      modelType: "expert", responseMessageId: 99,
     });
 
     expect(store.get("empty-session")).toBeUndefined();
@@ -25,12 +48,8 @@ describe("SessionStore", () => {
 
   it("matches full history across model switches", () => {
     const store = new SessionStore();
-    store.remember({
-      sessionId: "session-1",
-      modelType: "default",
+    remember(store, "session-1", [{ role: "user", content: "hello" }], "world", {
       responseMessageId: 42,
-      prompt: "hello",
-      responseText: "world",
     });
 
     const resolution = store.resolve({
@@ -53,14 +72,13 @@ describe("SessionStore", () => {
       const user = { role: "user", content: `request-${index}` };
       const assistant = { role: "assistant", content: `answer-${index}` };
       messages.push(user, assistant);
-      store.remember({
-        sessionId: "long-session",
-        modelType: "expert",
-        responseMessageId: index + 1,
-        prompt: `request-${index}`,
-        responseText: `answer-${index}`,
-        requestTurns: [{ role: "user", content: `request-${index}` }],
-      });
+      remember(
+        store,
+        "long-session",
+        messages.slice(0, -1).map((turn) => ({ role: String(turn.role), content: String(turn.content) })),
+        `answer-${index}`,
+        { modelType: "expert", responseMessageId: index + 1 },
+      );
     }
 
     expect(store.get("long-session")?.turns).toHaveLength(40);
@@ -71,12 +89,8 @@ describe("SessionStore", () => {
   it("resolves previous_response_id", () => {
     const store = new SessionStore();
     const sessionId = "123e4567-e89b-12d3-a456-426614174000";
-    store.remember({
-      sessionId,
-      modelType: "expert",
-      responseMessageId: 7,
-      prompt: "a",
-      responseText: "b",
+    remember(store, sessionId, [{ role: "user", content: "a" }], "b", {
+      modelType: "expert", responseMessageId: 7,
     });
     expect(store.resolve({ previous_response_id: `resp_${sessionId}` })).toMatchObject({
       sessionId,
@@ -86,13 +100,8 @@ describe("SessionStore", () => {
 
   it("does not include model type in fingerprint keys", () => {
     const store = new SessionStore();
-    store.remember({
-      sessionId: "same-session",
-      modelType: "default",
-      responseMessageId: 1,
+    remember(store, "same-session", [{ role: "user", content: "hello" }], "world", {
       convKey: "fp:user:hello\n---\nassistant:world",
-      prompt: "hello",
-      responseText: "world",
     });
     expect(
       store.resolve({
@@ -108,14 +117,9 @@ describe("SessionStore", () => {
 
   it("matches a tool result against the preceding structured assistant call", () => {
     const store = new SessionStore();
-    store.remember({
-      sessionId: "tool-session",
-      modelType: "default",
+    const callBlock = block("get_weather", { city: "Hefei" });
+    remember(store, "tool-session", [{ role: "user", content: "weather" }], callBlock, {
       responseMessageId: 9,
-      prompt: "weather",
-      responseText: canonicalAssistantText(
-        '<tool_call>\n{"name":"get_weather","arguments":{"city":"Hefei"}}\n</tool_call>',
-      ),
     });
 
     expect(
@@ -134,21 +138,15 @@ describe("SessionStore", () => {
 
   it("reuses structured tool history while storing no reasoning prose", () => {
     const store = new SessionStore();
-    const canonical = canonicalAssistantText(
-      '<tool_call>\n{"name":"bash","arguments":{"command":"date"}}\n</tool_call>',
-    );
-    store.remember({
-      sessionId: "hidden-tool-session",
-      modelType: "expert",
-      responseMessageId: 12,
-      prompt: "今天日期",
-      responseText: canonical,
+    const callBlock = block("bash", { command: "date" });
+    remember(store, "hidden-tool-session", [{ role: "user", content: "今天日期" }], callBlock, {
+      modelType: "expert", responseMessageId: 12,
     });
 
-    expect(canonical).toBe(
+    expect(callBlock).toBe(
       '<tool_call>\n{"arguments":{"command":"date"},"name":"bash"}\n</tool_call>',
     );
-    expect(canonical).not.toContain("Need current data");
+    expect(callBlock).not.toContain("Need current data");
     expect(store.get("hidden-tool-session")?.turns.at(-1)?.content).toBe(
       '<tool_call> {"arguments":{"command":"date"},"name":"bash"} </tool_call>',
     );
@@ -164,5 +162,166 @@ describe("SessionStore", () => {
         ],
       }),
     ).toMatchObject({ sessionId: "hidden-tool-session", parentMessageId: 12 });
+  });
+
+  it("keeps an agent tool-call turn and its result in one session", () => {
+    const store = new SessionStore();
+    const callBlock = block("Read", { file_path: "f:/x.ts" });
+    // Round 1: user asks, model emits a tool call.
+    remember(store, "agent-session", [{ role: "user", content: "read this" }], callBlock, {
+      responseMessageId: 10,
+    });
+
+    // Round 2: client replays user/assistant call, adds the tool result.
+    const round2: MessageTurn[] = [
+      { role: "user", content: "read this" },
+      { role: "assistant", content: callBlock },
+      { role: "tool", content: "export const value = 1" },
+    ];
+    const resolution = store.resolve({ messages: round2 });
+    expect(resolution.sessionId).toBe("agent-session");
+    remember(store, "agent-session", round2, "The file exports value 1.", {
+      responseMessageId: 11,
+    });
+
+    // Stored turns keep the expanded form: user, assistant call, tool, answer.
+    const turns = store.get("agent-session")?.turns ?? [];
+    expect(turns.map((turn) => turn.role)).toEqual([
+      "user", "assistant", "tool", "assistant",
+    ]);
+
+    // Round 3: a follow-up question still resolves the same session.
+    const followUp = store.resolve({
+      messages: [
+        ...turns,
+        { role: "user", content: "what is exported?" },
+      ],
+    });
+    expect(followUp.sessionId).toBe("agent-session");
+    expect(followUp.parentMessageId).toBe(11);
+  });
+
+  it("upgrades a legacy canonical session to expanded form on the next turn", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ds-sessions-"));
+    const file = path.join(dir, "sessions.json");
+    const callBlock = block("Read", { file_path: "f:/x.ts" });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        // Legacy storage collapsed the tool turn into one canonical assistant.
+        sessions: {
+          "legacy-agent": {
+            lastResponseMessageId: 20,
+            updatedAt: Date.now(),
+            turns: [
+              { role: "user", content: "read this" },
+              { role: "assistant", content: callBlock },
+            ],
+          },
+        },
+        convs: {},
+      }),
+    );
+    const store = new SessionStore(file);
+
+    // Client replay with expanded tool result still identifies the old session.
+    const replay: MessageTurn[] = [
+      { role: "user", content: "read this" },
+      { role: "assistant", content: callBlock },
+      { role: "tool", content: "const value = 1" },
+    ];
+    const resolution = store.resolve({ messages: replay });
+    expect(resolution.sessionId).toBe("legacy-agent");
+    remember(store, "legacy-agent", replay, "It exports value.", {
+      responseMessageId: 21,
+    });
+
+    // The entry is upgraded: roles include the tool turn, no canonical collapse.
+    const turns = store.get("legacy-agent")?.turns ?? [];
+    expect(turns.map((turn) => turn.role)).toEqual([
+      "user", "assistant", "tool", "assistant",
+    ]);
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("continues a DSML thread when the client replays residue text and a function_call item", () => {
+    const store = new SessionStore();
+    const dsml =
+      '< calls> <｜｜DSML｜｜invoke name="run_code"><｜｜DSML｜｜parameter name="code" string="true">ls</｜｜DSML｜｜parameter>' +
+      '<｜｜DSML｜｜parameter name="description" string="true">List files</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>';
+    remember(
+      store,
+      "dsml-session",
+      [{ role: "user", content: "inspect backend" }],
+      canonicalAssistantText(dsml),
+      { responseMessageId: 5 },
+    );
+
+    const resolution = store.resolve({
+      input: [
+        { type: "message", role: "user", content: "inspect backend" },
+        { type: "message", role: "assistant", content: "< calls>" },
+        {
+          type: "function_call",
+          call_id: "call_x",
+          name: "run_code",
+          arguments: '{"code":"ls","description":"List files"}',
+        },
+        { type: "function_call_output", call_id: "call_x", output: "done" },
+        { type: "message", role: "user", content: "继续" },
+      ],
+    });
+
+    expect(resolution).toMatchObject({ sessionId: "dsml-session", parentMessageId: 5 });
+  });
+
+  it("migrates raw fingerprint keys and wrapper residue when loading from disk", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ds-sessions-"));
+    const file = path.join(dir, "sessions.json");
+    const legacyAssistant =
+      "< calls> <tool_call> {\"arguments\":{\"city\":\"Hefei\"},\"name\":\"get_weather\"} </tool_call>";
+    const rawFp = `user:weather\n---\nassistant:${legacyAssistant}`;
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        sessions: {
+          "legacy-session": {
+            lastResponseMessageId: 7,
+            updatedAt: Date.now(),
+            turns: [
+              { role: "user", content: "weather" },
+              { role: "assistant", content: legacyAssistant },
+              { role: "assistant", content: "< calls>" },
+            ],
+          },
+        },
+        convs: { [`fp:${rawFp}`]: "legacy-session" },
+      }),
+    );
+
+    const store = new SessionStore(file);
+    remember(store, "trigger-session", [{ role: "user", content: "ping" }], "pong");
+    store.close();
+
+    const onDisk = JSON.parse(fs.readFileSync(file, "utf8"));
+    expect(Object.keys(onDisk.convs).every((key) => /^fp:[0-9a-f]{64}$/.test(key))).toBe(true);
+    const assistantTurns = onDisk.sessions["legacy-session"].turns.filter(
+      (turn: { role: string }) => turn.role === "assistant",
+    );
+    expect(assistantTurns).toHaveLength(1);
+    expect(assistantTurns[0].content).not.toContain("< calls>");
+
+    const reopened = new SessionStore(file);
+    const resolution = reopened.resolve({
+      messages: [
+        { role: "user", content: "weather" },
+        { role: "assistant", content: legacyAssistant },
+        { role: "user", content: "next" },
+      ],
+    });
+    expect(resolution).toMatchObject({ sessionId: "legacy-session", parentMessageId: 7 });
+
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

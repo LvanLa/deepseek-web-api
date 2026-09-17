@@ -3,8 +3,9 @@ import { createHash } from "node:crypto";
 
 import { isRecord } from "../utils/json.js";
 import { messageText } from "../utils/text.js";
+import { stripBareWrapperTags } from "./dsmlToolCalls.js";
 import type { MessageTurn, RequestBody } from "./types.js";
-import { formatToolCall, stableJson } from "./toolCalls.js";
+import { formatToolCall, stableJson, type ToolDefHint } from "./toolCalls.js";
 
 interface PreviousPromptState {
   turns?: readonly MessageTurn[];
@@ -20,10 +21,12 @@ export interface PromptBuildOptions {
 export interface BuiltPrompt {
   prompt: string;
   requestTurns: MessageTurn[];
+  allTurns: MessageTurn[];
   latestUserText: string;
   instructionFingerprint: string;
   toolsFingerprint: string;
   hasTools: boolean;
+  toolHints: ToolDefHint[];
 }
 
 function hash(value: string): string {
@@ -99,7 +102,9 @@ function conversationTurn(item: unknown): MessageTurn | null {
   }
   const text = valueText(item);
   const calls = structuredCalls(item);
-  const content = [text, ...calls].filter(Boolean).join("\n");
+  // Drop mangled wrapper leftovers ("< calls>") from replayed assistant history.
+  const visibleText = role === "assistant" ? stripBareWrapperTags(text) : text;
+  const content = [visibleText, ...calls].filter(Boolean).join("\n");
   return content ? { role, content } : null;
 }
 
@@ -151,6 +156,7 @@ function toolState(body: RequestBody): { text: string; fingerprint: string; hasT
     "Rules:",
     "- Open tag is exactly <tool_call> and close tag is exactly </tool_call>.",
     "- Never write <_call>, <tool_call name=...>, attributes on the tag, or nested wrappers.",
+    "- Ignore any tools built into the web chat itself (such as a native run_code or sandbox tool) and never emit XML-style invoke/parameter tool tags; only the tools listed below exist, and they must use the <tool_call> JSON shape above.",
     "- JSON must include both name and arguments, and every string, {, and [ must be fully closed.",
     "- arguments must match the selected tool schema. Each call must be one complete block.",
     "- Multiple tools = multiple consecutive complete blocks.",
@@ -213,6 +219,7 @@ export function buildToolRecoveryPrompt(
   const policy = [
     "The previous upstream completion produced no usable tool call or final answer. Continue the same task.",
     "After tool results, output either complete <tool_call> JSON blocks in RESPONSE or the final user-visible answer in RESPONSE.",
+    "Do not use XML-style invoke/parameter tool tags or any built-in web chat tool such as run_code; only <tool_call> JSON blocks count.",
     "Never end with THINK-only and never leave RESPONSE empty.",
     names.length ? `Available tools: ${names.join(", ")}` : "",
   ].filter(Boolean).join("\n");
@@ -244,9 +251,27 @@ export function buildDeepSeekPrompt(body: RequestBody, options: PromptBuildOptio
   return {
     prompt,
     requestTurns: selectedTurns,
+    allTurns: turns,
     latestUserText,
     instructionFingerprint: currentInstructionFingerprint || options.previous?.instructionFingerprint || "",
     toolsFingerprint: tools.fingerprint,
     hasTools: tools.hasTools,
+    toolHints: configuredToolDefs(body),
   };
+}
+
+/** Extract registered tool names and parameter keys from tools/functions fields. */
+export function configuredToolDefs(body: RequestBody): ToolDefHint[] {
+  const values: unknown[] = [
+    ...(Array.isArray(body.tools) ? body.tools : []),
+    ...(Array.isArray(body.functions) ? body.functions : []),
+  ];
+  return values.flatMap((value) => {
+    if (!isRecord(value)) return [];
+    const fn = isRecord(value.function) ? value.function : value;
+    if (typeof fn.name !== "string" || !fn.name.trim()) return [];
+    const parameters = isRecord(fn.parameters) ? fn.parameters : null;
+    const paramKeys = parameters && isRecord(parameters.properties) ? Object.keys(parameters.properties) : [];
+    return [{ name: fn.name.trim(), paramKeys }];
+  });
 }

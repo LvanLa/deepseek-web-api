@@ -1,35 +1,36 @@
-/**
- * Persists DeepSeek session lineage and resolves continuation requests.
- * Session identity is deliberately model-agnostic so model or thinking changes do not fork.
- */
-import fs from "node:fs";
-import path from "node:path";
+/** Persists DeepSeek session lineage; identity is model-agnostic to prevent forking. */
 import type { Logger } from "../utils/logger.js";
 import { isRecord } from "../utils/json.js";
 import { normalizeText } from "../utils/text.js";
 import { requestConversationTurns } from "./promptBuild.js";
-import { fingerprint, fpKey, turnsEqual, turnsPrefix, turnsSuffix } from "./sessionTurns.js";
+import { stripBareWrapperTags } from "./dsmlToolCalls.js";
+import { SessionFile } from "./sessionFile.js";
+import { fingerprint, fpKey, foldTurns, turnsEqual, turnsPrefix, turnsSuffix } from "./sessionTurns.js";
 import type { MessageTurn, ModelType, RequestBody } from "./types.js";
+
+const MAX_SESSIONS = 500;
+const MAX_TURNS = 40;
+const HASHED_FP_KEY = /^fp:[0-9a-f]{64}$/;
+
+/** Last at most ``cap`` turns, starting at a user boundary when reachable. */
+function requestWindow(turns: readonly MessageTurn[], cap: number): MessageTurn[] {
+  if (turns.length <= cap) return turns.map((turn) => ({ ...turn }));
+  let start = turns.length - cap;
+  while (start < turns.length && turns[start]?.role !== "user") start += 1;
+  if (start >= turns.length) start = turns.length - cap;
+  return turns.slice(start).map((turn) => ({ ...turn }));
+}
+
 export type MessageId = string | number | null;
 export interface SessionEntry {
   lastResponseMessageId: MessageId;
-  lastModelType?: ModelType;
-  modelType?: ModelType;
-  instructionFingerprint?: string;
-  toolsFingerprint?: string;
-  updatedAt: number;
-  turns: MessageTurn[];
+  lastModelType?: ModelType; modelType?: ModelType;
+  instructionFingerprint?: string; toolsFingerprint?: string;
+  updatedAt: number; turns: MessageTurn[];
 }
 export interface ConversationResolution {
-  sessionId: string | null;
-  parentMessageId: MessageId;
-  key: string | null;
-  pendingFingerprint?: string;
-  createIfMissing?: boolean;
-}
-interface SessionDisk {
-  sessions: Record<string, SessionEntry>;
-  convs: Record<string, string>;
+  sessionId: string | null; parentMessageId: MessageId; key: string | null;
+  pendingFingerprint?: string; createIfMissing?: boolean;
 }
 /** Exclude the trailing request turn because it is not stored history yet. */
 function historyTurns(messages: unknown): MessageTurn[] {
@@ -49,7 +50,6 @@ function parentId(value: unknown): MessageId {
   return typeof value === "string" || typeof value === "number" ? value : null;
 }
 
-
 function parseModelType(value: unknown): ModelType | undefined {
   return value === "default" || value === "expert" ? value : undefined;
 }
@@ -59,7 +59,9 @@ function parseSessionEntry(value: unknown): SessionEntry | null {
   const turns: MessageTurn[] = [];
   for (const turn of value.turns) {
     if (!isRecord(turn) || typeof turn.role !== "string" || typeof turn.content !== "string") return null;
-    turns.push({ role: turn.role, content: turn.content });
+    // Legacy disk entries may contain wrapper leftovers or standalone residue.
+    const content = turn.role === "assistant" ? stripBareWrapperTags(turn.content) : turn.content;
+    if (content.trim()) turns.push({ role: turn.role, content });
   }
   const lastResponseMessageId = parentId(value.lastResponseMessageId);
   const lastModelType = parseModelType(value.lastModelType);
@@ -81,12 +83,18 @@ function parseSessionEntry(value: unknown): SessionEntry | null {
 export class SessionStore {
   private readonly sessions = new Map<string, SessionEntry>();
   private readonly convIndex = new Map<string, string>();
+  private readonly storage: SessionFile;
+  private readonly logger: Logger | undefined;
 
-  constructor(
-    private readonly file?: string,
-    private readonly logger?: Logger,
-  ) {
+  constructor(file?: string, logger?: Logger) {
+    this.logger = logger;
+    this.storage = new SessionFile(file, logger);
     this.load();
+  }
+
+  /** Flush buffered persistence and release the single-instance lock. */
+  close(): void {
+    this.storage.close();
   }
 
   has(sessionId: string): boolean {
@@ -101,11 +109,8 @@ export class SessionStore {
   resolve(body: RequestBody): ConversationResolution {
     const meta = metadata(body);
     const explicit = stringId(
-      body.chat_session_id ??
-        body.conversation ??
-        body.conversation_id ??
-        meta.chat_session_id ??
-        meta.conversation_id,
+      body.chat_session_id ?? body.conversation ?? body.conversation_id
+        ?? meta.chat_session_id ?? meta.conversation_id,
     );
     if (explicit) return this.resolveExplicit(explicit, parentId(body.parent_message_id), "id");
 
@@ -123,33 +128,27 @@ export class SessionStore {
     return { sessionId: null, parentMessageId: null, key: null };
   }
 
-  /** Save the response message ID required as the next parent_message_id. */
+  /**
+   * Save the response message ID required as the next parent_message_id.
+   * The stored turns are the client's expanded request window (user, assistant
+   * call turns, tool results) plus the structured assistant response, so the
+   * next replayed request matches stored turns by construction.
+   */
   remember(input: {
-    sessionId: string;
-    modelType: ModelType;
-    responseMessageId: MessageId;
-    convKey?: string | null;
-    prompt: string;
-    responseText: string;
-    requestTurns?: MessageTurn[];
-    instructionFingerprint?: string;
-    toolsFingerprint?: string;
+    sessionId: string; modelType: ModelType; responseMessageId: MessageId;
+    convKey?: string | null; fullTurns: MessageTurn[]; assistantContent: string;
+    instructionFingerprint?: string; toolsFingerprint?: string;
   }): void {
-    const assistantText = normalizeText(input.responseText);
+    const assistantText = normalizeText(input.assistantContent);
     if (!assistantText.trim()) {
-      this.logger?.warn("Skipping empty assistant turn", {
-        sessionId: input.sessionId,
-        responseMessageId: input.responseMessageId,
-      });
+      this.logger?.warn("Skipping empty assistant turn", { sessionId: input.sessionId, responseMessageId: input.responseMessageId });
       return;
     }
     const previous = this.sessions.get(input.sessionId);
-    const turns = previous ? [...previous.turns] : [];
-    const requests = input.requestTurns?.length
-      ? input.requestTurns
-      : [{ role: "user", content: input.prompt }];
-    turns.push(...requests.map((turn) => ({ role: turn.role, content: normalizeText(turn.content) })));
-    turns.push({ role: "assistant", content: assistantText });
+    const turns: MessageTurn[] = [
+      ...requestWindow(input.fullTurns, MAX_TURNS - 1),
+      { role: "assistant", content: assistantText },
+    ];
     const instructionFingerprint = input.instructionFingerprint ?? previous?.instructionFingerprint;
     const toolsFingerprint = input.toolsFingerprint ?? previous?.toolsFingerprint;
     const entry: SessionEntry = {
@@ -159,28 +158,27 @@ export class SessionStore {
       ...(instructionFingerprint ? { instructionFingerprint } : {}),
       ...(toolsFingerprint ? { toolsFingerprint } : {}),
       updatedAt: Date.now(),
-      turns: turns.slice(-40),
+      turns,
     };
     this.sessions.set(input.sessionId, entry);
+    this.prune();
     if (input.convKey) this.convIndex.set(input.convKey, input.sessionId);
-    // Index only assistant boundaries so each completed turn can resume independently.
-    for (let end = 2; end <= entry.turns.length; end += 2) {
-      this.convIndex.set(fpKey(fingerprint(entry.turns.slice(0, end))), input.sessionId);
+    // Index folded-round fingerprints at each assistant boundary so any
+    // completed logical turn can resume independently.
+    const folded = foldTurns(turns);
+    this.convIndex.set(fpKey(fingerprint(folded)), input.sessionId);
+    for (let end = 1; end <= folded.length; end += 1) {
+      if (folded[end - 1]?.role === "assistant")
+        this.convIndex.set(fpKey(fingerprint(folded.slice(0, end))), input.sessionId);
     }
     this.save();
   }
 
-  private resolveExplicit(
-    sessionId: string,
-    fallbackParent: MessageId,
-    prefix: "id" | "prev",
-  ): ConversationResolution {
+  private resolveExplicit(sessionId: string, fallbackParent: MessageId, prefix: "id" | "prev"): ConversationResolution {
     const entry = this.sessions.get(sessionId);
     return {
-      sessionId,
-      parentMessageId: entry?.lastResponseMessageId ?? fallbackParent,
-      key: `${prefix}:${sessionId}`,
-      ...(!entry ? { createIfMissing: true } : {}),
+      sessionId, parentMessageId: entry?.lastResponseMessageId ?? fallbackParent,
+      key: `${prefix}:${sessionId}`, ...(!entry ? { createIfMissing: true } : {}),
     };
   }
 
@@ -194,38 +192,52 @@ export class SessionStore {
     return null;
   }
 
-  /** Use exact fingerprints before conservative equality, prefix, and assistant-tail matches. */
+  /** Match folded rounds via exact fingerprints, then equality, prefix, user chain, assistant tail. */
   private resolveHistory(messages: unknown[]): ConversationResolution {
     const turns = historyTurns(messages);
     if (turns.length === 0) return { sessionId: null, parentMessageId: null, key: null };
-    const key = fpKey(fingerprint(turns));
-    const exact = this.convIndex.get(key) ?? this.findLegacy(fingerprint(turns));
+    const folded = foldTurns(turns);
+    const key = fpKey(fingerprint(folded));
+    const exact = this.convIndex.get(key) ?? this.findLegacy(fingerprint(folded));
     if (exact && this.sessions.has(exact)) return this.found(exact, key);
 
     let best: { sessionId: string; score: number } | undefined;
     for (const [sessionId, entry] of this.sessions) {
-      const stored = entry.turns.map((turn) => ({ ...turn, content: normalizeText(turn.content) }));
-      let score = 0;
-      if (
-        turnsEqual(stored, turns) ||
-        turnsPrefix(stored, turns) ||
-        turnsPrefix(turns, stored) ||
-        turnsSuffix(stored, turns) ||
-        turnsSuffix(turns, stored)
-      ) {
-        score = Math.min(stored.length, turns.length);
-      } else {
-        const lastIncoming = [...turns].reverse().find((turn) => turn.role === "assistant");
-        const lastStored = [...stored].reverse().find((turn) => turn.role === "assistant");
-        if (
-          lastIncoming?.content &&
-          normalizeText(lastIncoming.content) === normalizeText(lastStored?.content ?? "")
-        ) score = 0.5;
-      }
+      const score = this.historyScore(folded, foldTurns(entry.turns), turns);
       if (score > 0 && (!best || score > best.score)) best = { sessionId, score };
     }
     if (best) return this.found(best.sessionId, key);
     return { sessionId: null, parentMessageId: null, key, pendingFingerprint: key };
+  }
+
+  private historyScore(incoming: MessageTurn[], storedFolded: MessageTurn[], rawIncoming: MessageTurn[]): number {
+    if (
+      turnsEqual(storedFolded, incoming) ||
+      turnsPrefix(storedFolded, incoming) ||
+      turnsPrefix(incoming, storedFolded) ||
+      turnsSuffix(storedFolded, incoming) ||
+      turnsSuffix(incoming, storedFolded)
+    ) {
+      return Math.min(storedFolded.length, incoming.length);
+    }
+    // Logical user chain identical: tolerate minor tool-block formatting drift.
+    const usersOf = (values: MessageTurn[]): string[] =>
+      values.filter((turn) => turn.role === "user").map((turn) => normalizeText(turn.content));
+    const usersIn = usersOf(incoming);
+    const usersStored = usersOf(storedFolded);
+    if (
+      usersIn.length > 0 &&
+      usersIn.length === usersStored.length &&
+      usersIn.every((user, index) => user === usersStored[index])
+    ) {
+      return usersIn.length + 0.25;
+    }
+    const lastIncoming = [...rawIncoming].reverse().find((turn) => turn.role === "assistant");
+    const lastStored = [...storedFolded].reverse().find((turn) => turn.role === "assistant");
+    return lastIncoming?.content &&
+      normalizeText(lastIncoming.content) === normalizeText(lastStored?.content ?? "")
+      ? 0.5
+      : 0;
   }
 
   private found(sessionId: string, key: string): ConversationResolution {
@@ -238,45 +250,44 @@ export class SessionStore {
 
   private findLegacy(value: string): string | undefined {
     return ["default", "expert", "vision"]
-      .map((model) => this.convIndex.get(`fp:${model}:${value}`))
+      .map((model) => this.convIndex.get(fpKey(`${model}:${value}`)))
       .find((sessionId) => sessionId !== undefined);
   }
 
+  private prune(): void {
+    if (this.sessions.size <= MAX_SESSIONS) return;
+    const oldest = [...this.sessions.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+    for (const [id] of oldest.slice(0, this.sessions.size - MAX_SESSIONS)) this.sessions.delete(id);
+  }
+
   private load(): void {
-    if (!this.file || !fs.existsSync(this.file)) return;
+    const raw = this.storage.read();
+    if (!raw) return;
     try {
-      const parsed: unknown = JSON.parse(fs.readFileSync(this.file, "utf8"));
+      const parsed: unknown = JSON.parse(raw);
       if (!isRecord(parsed) || !isRecord(parsed.sessions) || !isRecord(parsed.convs)) return;
       for (const [id, value] of Object.entries(parsed.sessions)) {
         const entry = parseSessionEntry(value);
         if (entry) this.sessions.set(id, entry);
       }
       for (const [key, value] of Object.entries(parsed.convs)) {
-        if (typeof value === "string") this.convIndex.set(key, value);
+        if (typeof value !== "string" || !this.sessions.has(value)) continue;
+        // Rewrite raw legacy fingerprint keys to hashed form; keep explicit keys intact.
+        const indexed = key.startsWith("fp:") && !HASHED_FP_KEY.test(key) ? fpKey(key.slice(3)) : key;
+        this.convIndex.set(indexed, value);
       }
     } catch (error) {
-      this.logger?.warn("无法读取 sessions.json，将使用空会话存储", {
+      this.logger?.warn("could not read sessions file; starting with an empty index", {
         error: error instanceof Error ? error.message : String(error),
       });
     }
   }
 
   private save(): void {
-    if (!this.file) return;
-    try {
-      fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
-      const data: SessionDisk = {
-        sessions: Object.fromEntries(this.sessions),
-        convs: Object.fromEntries(this.convIndex),
-      };
-      // Atomic replacement avoids leaving a truncated session file after interruption.
-      const temporary = `${this.file}.${process.pid}.tmp`;
-      fs.writeFileSync(temporary, JSON.stringify(data, null, 2), { encoding: "utf8", mode: 0o600 });
-      fs.renameSync(temporary, this.file);
-    } catch (error) {
-      this.logger?.error("无法保存 sessions.json", {
-        error: error instanceof Error ? error.message : String(error),
-      });
+    const convs: Record<string, string> = {};
+    for (const [key, sessionId] of this.convIndex) {
+      if (this.sessions.has(sessionId)) convs[key] = sessionId;
     }
+    this.storage.requestSave(JSON.stringify({ sessions: Object.fromEntries(this.sessions), convs }));
   }
 }

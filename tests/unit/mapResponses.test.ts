@@ -56,6 +56,30 @@ describe("consumeResponses", () => {
     expect(events.filter(({ event }) => event === "response.output_text.delta")).toEqual([]);
   });
 
+  it("hides the mangled < calls> residue of a native DSML run_code turn", async () => {
+    const output =
+      '< calls> <｜｜DSML｜｜ invoke name="run_code"> ' +
+      '<｜｜DSML｜｜ parameter name="code" string="true">ls</｜｜DSML｜｜ parameter> ' +
+      '<｜｜DSML｜｜ parameter name="description" string="true">List files</｜｜DSML｜｜ parameter> ' +
+      '</｜｜DSML｜｜ invoke> </｜｜DSML｜｜ calls>';
+    const events: EventRecord[] = [];
+    const result = await consumeResponses({
+      ...baseInput(upstream({ output })),
+      emit: (event, data) => events.push({ event, data }),
+    });
+
+    expect(result.response.output_text).toBe("");
+    expect(result.response.output.map((item) => item.type)).toEqual(["function_call"]);
+    expect(result.response.output[0]).toMatchObject({
+      type: "function_call",
+      name: "run_code",
+      arguments: '{"code":"ls","description":"List files"}',
+    });
+    expect(result.rawOutputText).not.toContain("< calls>");
+    expect(events.filter(({ event }) => event === "response.output_text.delta")).toEqual([]);
+    expect(JSON.stringify(events)).not.toContain("< calls>");
+  });
+
   it("maps a repaired truncated tool payload to a Responses function_call", async () => {
     const truncated = '<_call>\n{"name":"read","arguments":{"path":"package.json"}\n</tool_call>';
     const result = await consumeResponses(baseInput(upstream({ output: truncated })));
@@ -221,6 +245,41 @@ describe("consumeResponses", () => {
         .filter(({ event }) => event.endsWith(".delta") && event.includes("reasoning"))
         .map(({ event }) => event),
     ).toEqual(["response.reasoning_text.delta"]);
+  });
+
+  it("streams raw reasoning deltas live before the function call events", async () => {
+    const reasoning = "先检查天气。";
+    const tagged = '<tool_call>\n{"name":"get_weather","arguments":{"city":"Hefei"}}\n</tool_call>';
+    const events: EventRecord[] = [];
+    const result = await consumeResponses({
+      ...baseInput(upstream({ reasoning, output: tagged })),
+      toolReasoning: "raw",
+      emit: (event, data) => events.push({ event, data }),
+    });
+
+    const reasoningText = events
+      .filter(({ event }) => event === "response.reasoning_text.delta")
+      .map(({ data }) => data.delta)
+      .join("");
+    expect(reasoningText).toBe(reasoning);
+    const lastReasoningIndex = events
+      .map(({ event }) => event)
+      .lastIndexOf("response.reasoning_text.delta");
+    const firstCallIndex = events.findIndex(
+      ({ event, data }) =>
+        event === "response.output_item.added" &&
+        typeof data.item === "object" &&
+        data.item !== null &&
+        "type" in data.item &&
+        data.item.type === "function_call",
+    );
+    expect(lastReasoningIndex).toBeGreaterThanOrEqual(0);
+    expect(lastReasoningIndex).toBeLessThan(firstCallIndex);
+    expect(result.response.output.map((item) => item.type)).toEqual([
+      "reasoning",
+      "function_call",
+    ]);
+    expect(result.framesEmitted).toBeGreaterThan(0);
   });
 
   it("keeps multiple function calls ordered with continuous output indexes", async () => {

@@ -8,6 +8,7 @@ import { resolveModel, resolveSearch, resolveThinking } from "../../src/deepseek
     ["flash", "default", "deepseek-v4-flash"],
     ["default", "default", "deepseek-v4-flash"],
     ["deepseek-v4-flash", "default", "deepseek-v4-flash"],
+    ["deepseek-v4.1-flash", "default", "deepseek-v4.1-flash"],
     ["pro", "expert", "deepseek-v4-pro"],
     ["expert", "expert", "deepseek-v4-pro"],
     ["deepseek-reasoner", "expert", "deepseek-v4-pro"],
