@@ -40,6 +40,7 @@ export interface ToolStreamValue {
   responseMessageId: MessageId;
   framesEmitted: number;
   finishReason: "stop" | "tool_calls";
+  upstreamTrace: string[];
 }
 
 function chatChunk(
@@ -155,10 +156,11 @@ export async function streamToolChat(
     responseMessageId: result.responseMessageId,
     framesEmitted: result.framesEmitted,
     finishReason: result.toolCalls.length > 0 ? "tool_calls" : "stop",
+    upstreamTrace: result.upstreamTrace,
   };
 }
 
-export function toolDiagnostics(outcome: ToolTurnOutcome): CompletionDiagnostics {
+export function toolDiagnostics(outcome: ToolTurnOutcome, upstreamTrace?: string[]): CompletionDiagnostics {
   return {
     reasoningChars: outcome.reasoningText.length,
     outputChars: outcome.outputText.length,
@@ -166,6 +168,7 @@ export function toolDiagnostics(outcome: ToolTurnOutcome): CompletionDiagnostics
     emptyUpstream: outcome.emptyUpstream,
     recoverableEmpty: outcome.recoverableEmpty,
     promotedReasoning: outcome.promotedReasoning,
+    ...(upstreamTrace ? { upstreamTrace } : {}),
   };
 }
 

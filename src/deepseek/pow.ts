@@ -43,6 +43,9 @@ const PREPARE_SCRIPT = `async ({ powWorkerUrl, modelType, fallbackToken, session
   });
   const challengeBody = await challengeResponse.json();
   const challengeRoot = record(challengeBody) ? challengeBody : null;
+  const challengeMsg = challengeRoot && typeof challengeRoot.msg === "string" ? challengeRoot.msg : "";
+  const challengeAuthFailed = challengeRoot && (challengeRoot.code === 40003 ||
+    /authorization failed|invalid token/i.test(challengeMsg));
   const challengeData = challengeRoot && record(challengeRoot.data) ? challengeRoot.data : null;
   const challengeBizData = challengeData && record(challengeData.biz_data) ? challengeData.biz_data : null;
   const challenge = challengeBizData && record(challengeBizData.challenge) ? challengeBizData.challenge : null;
@@ -54,7 +57,8 @@ const PREPARE_SCRIPT = `async ({ powWorkerUrl, modelType, fallbackToken, session
     challengeData.biz_code !== 0 ||
     !challenge
   ) {
-    throw new Error("pow challenge failed: " + JSON.stringify(challengeBody));
+    const prefix = challengeAuthFailed ? "deepseek-auth-token-invalid: " : "pow challenge failed: ";
+    throw new Error(prefix + JSON.stringify(challengeBody));
   }
 
   const workerResponse = await fetch(powWorkerUrl);
@@ -114,12 +118,16 @@ const PREPARE_SCRIPT = `async ({ powWorkerUrl, modelType, fallbackToken, session
     });
     const sessionBody = await sessionResponse.json();
     const sessionRoot = record(sessionBody) ? sessionBody : null;
+    const sessionMsg = sessionRoot && typeof sessionRoot.msg === "string" ? sessionRoot.msg : "";
+    const sessionAuthFailed = sessionRoot && (sessionRoot.code === 40003 ||
+      /authorization failed|invalid token/i.test(sessionMsg));
     const sessionData = sessionRoot && record(sessionRoot.data) ? sessionRoot.data : null;
     const sessionBizData = sessionData && record(sessionData.biz_data) ? sessionData.biz_data : null;
     const session = sessionBizData && record(sessionBizData.chat_session) ? sessionBizData.chat_session : null;
     resolvedSessionId = session && typeof session.id === "string" ? session.id : null;
     if (!sessionResponse.ok || !resolvedSessionId) {
-      throw new Error("session create failed: " + JSON.stringify(sessionBody));
+      const prefix = sessionAuthFailed ? "deepseek-auth-token-invalid: " : "session create failed: ";
+      throw new Error(prefix + JSON.stringify(sessionBody));
     }
   }
 

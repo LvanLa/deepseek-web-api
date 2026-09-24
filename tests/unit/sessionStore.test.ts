@@ -324,4 +324,64 @@ describe("SessionStore", () => {
 
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  it("keeps a sliding-window agent on one session via instruction fingerprint", () => {
+    const store = new SessionStore();
+    const first: MessageTurn[] = [
+      { role: "assistant", content: '<tool_call> {"name":"read","arguments":{"path":"a.py"}} </tool_call>' },
+      { role: "tool", content: "a.py contents" },
+    ];
+    store.remember({
+      sessionId: "sticky-session", modelType: "default", responseMessageId: 30,
+      fullTurns: first,
+      assistantContent: '<tool_call> {"name":"read","arguments":{"path":"b.py"}} </tool_call>',
+      instructionFingerprint: "instr-hash-1",
+    });
+
+    expect(store.resolveInstruction("instr-hash-1")).toMatchObject({
+      sessionId: "sticky-session", parentMessageId: 30,
+    });
+    expect(store.resolveInstruction("instr-hash-other")).toBeUndefined();
+
+    // Non-cumulative replay (oldest rounds dropped, fresh ones added):
+    // history matching cannot see the relationship, key is pending.
+    const sliding: MessageTurn[] = [
+      { role: "assistant", content: '<tool_call> {"name":"read","arguments":{"path":"c.py"}} </tool_call>' },
+      { role: "tool", content: "c.py contents" },
+    ];
+    const missed = store.resolve({ messages: sliding });
+    expect(missed.sessionId).toBeNull();
+    expect(missed.key).not.toBeNull();
+    // The identical instruction hash glues it back to the same upstream session.
+    const glued = store.resolveInstruction("instr-hash-1");
+    expect(glued?.sessionId).toBe("sticky-session");
+    expect(glued?.parentMessageId).toBe(30);
+  });
+
+  it("restores the instruction sticky index from disk", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ds-sessions-"));
+    const file = path.join(dir, "sessions.json");
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        sessions: {
+          "saved-session": {
+            lastResponseMessageId: 5,
+            updatedAt: Date.now(),
+            turns: [
+              { role: "assistant", content: '<tool_call> {"name":"read","arguments":{}} </tool_call>' },
+            ],
+          },
+        },
+        convs: {},
+        instructions: { "instr-hash-1": "saved-session" },
+      }),
+    );
+    const store = new SessionStore(file);
+    expect(store.resolveInstruction("instr-hash-1")).toMatchObject({
+      sessionId: "saved-session", parentMessageId: 5,
+    });
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
 });

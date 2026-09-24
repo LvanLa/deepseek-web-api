@@ -32,6 +32,7 @@ export interface OpenAIResponse {
 export interface CompletionDiagnostics {
   reasoningChars: number; outputChars: number; toolCallCount: number;
   emptyUpstream: boolean; recoverableEmpty: boolean; promotedReasoning: boolean;
+  upstreamTrace?: string[];
 }
 export interface MappedResponseResult {
   response: OpenAIResponse;
@@ -95,6 +96,7 @@ function toDiagnostics(
   outputText: string,
   outcome: ToolTurnOutcome,
   toolCallCount: number,
+  upstreamTrace?: string[],
 ): CompletionDiagnostics {
   return {
     reasoningChars: reasoning.length,
@@ -102,6 +104,7 @@ function toDiagnostics(
     toolCallCount,
     emptyUpstream: outcome.emptyUpstream,
     recoverableEmpty: outcome.recoverableEmpty, promotedReasoning: outcome.promotedReasoning,
+    ...(upstreamTrace ? { upstreamTrace } : {}),
   };
 }
 
@@ -184,21 +187,15 @@ async function consumeToolResponses(
   } else {
     // Buffered non-streaming assembly: preserve promotion/visibility rules.
     visibleText = parsed.content;
-    const reasoningVisible = hasToolCalls
-      ? input.toolReasoning === "clean"
-        ? parseToolCalls(turn.reasoningText).content
-        : ""
-      : turn.outcome.promotedReasoning
-        ? ""
-        : hasResponseText
-          ? turn.reasoningText
-          : "";
-    const shouldIncludeMessage = !hasToolCalls || visibleText.length > 0;
-    if (reasoningVisible && !writer.reasoningOpened) writer.emitReasoningDelta(reasoningVisible);
-    if (shouldIncludeMessage && !writer.messageOpened && visibleText) {
-      writer.emitOutputDelta(visibleText);
+    let reasoningVisible = "";
+    if (hasToolCalls) {
+      if (input.toolReasoning === "clean") reasoningVisible = parseToolCalls(turn.reasoningText).content;
+    } else if (!turn.outcome.promotedReasoning && hasResponseText) {
+      reasoningVisible = turn.reasoningText;
     }
-    if (shouldIncludeMessage && !writer.messageOpened) writer.emitOutputDelta("");
+    const includeMessage = !hasToolCalls || visibleText.length > 0;
+    if (reasoningVisible && !writer.reasoningOpened) writer.emitReasoningDelta(reasoningVisible);
+    if (includeMessage && !writer.messageOpened) writer.emitOutputDelta(visibleText || "");
     writer.finishReasoning(reasoningVisible, output);
     writer.finishMessage(visibleText, output);
     for (const call of parsed.toolCalls) emitFunctionCall(call);
@@ -208,19 +205,14 @@ async function consumeToolResponses(
   // resolved (promoted/fallback) content, never raw upstream protocol garbage.
   const rawOutputText = hasToolCalls ? canonicalParsedAssistantText(parsed) : parsed.content;
   const final: OpenAIResponse = {
-    id,
-    object: "response",
-    created_at: createdAt,
-    status: "completed",
+    id, object: "response", created_at: createdAt, status: "completed",
     model: input.publicModel,
     output,
     output_text: visibleText,
     ...(turn.title ? { title: turn.title } : {}),
     usage: { input_tokens: 0, output_tokens: turn.tokens, total_tokens: turn.tokens },
     metadata: buildMetadata(input, {
-      requestMessageId: turn.requestMessageId,
-      responseMessageId: turn.responseMessageId,
-      title: turn.title,
+      requestMessageId: turn.requestMessageId, responseMessageId: turn.responseMessageId, title: turn.title,
     }),
   };
   writer.emit("response.completed", { type: "response.completed", response: final });
@@ -229,7 +221,13 @@ async function consumeToolResponses(
     requestMessageId: turn.requestMessageId,
     responseMessageId: turn.responseMessageId,
     rawOutputText,
-    diagnostics: toDiagnostics(turn.reasoningText, turn.responseText, turn.outcome, parsed.toolCalls.length),
+    diagnostics: toDiagnostics(
+      turn.reasoningText,
+      turn.responseText,
+      turn.outcome,
+      parsed.toolCalls.length,
+      turn.upstreamTrace,
+    ),
     framesEmitted: live ? turn.framesEmitted : 0,
   };
 }

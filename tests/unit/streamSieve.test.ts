@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 
 import { StreamSieve, type SieveEvent } from "../../src/deepseek/streamSieve.js";
+import { parseToolCalls } from "../../src/deepseek/toolCalls.js";
 
 function feedChunks(sieve: StreamSieve, chunks: string[]): SieveEvent[] {
   return chunks.flatMap((chunk) => sieve.feed(chunk));
@@ -192,6 +193,71 @@ describe("StreamSieve DSML", () => {
     expect(sieve.calls).toHaveLength(4);
     expect(sieve.flush()).toEqual([]);
   });
+
+  it("hides whitespace between two adjacent wrappers fed one char at a time", () => {
+    const wrapper = (name: string) => [
+      "<｜｜DSML｜｜ calls>",
+      `<｜｜DSML｜｜ invoke name="${name}">`,
+      `<｜｜DSML｜｜ parameter name="path" string="true">${name.toLowerCase()}</｜｜DSML｜｜ parameter>`,
+      "</｜｜DSML｜｜ invoke>",
+      "</｜｜DSML｜｜ calls>",
+    ].join("");
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, splitEvery(`${wrapper("LS")}    ${wrapper("Read")}`, 1));
+    events.push(...sieve.flush());
+    expect(textDeltas(events)).toBe("");
+    expect(toolCallsOf(events).map((call) => call.function.name)).toEqual(["LS", "Read"]);
+  });
+
+  it("captures DSML whose label gaps are NBSP instead of regular spaces", () => {
+    const gap = " ";
+    const text = [
+      `<｜｜DSML｜｜${gap}calls>`,
+      `<｜｜DSML｜｜${gap}invoke name="LS">`,
+      `<｜｜DSML｜｜${gap}parameter name="path" string="true">src</｜｜DSML｜｜parameter>`,
+      `</｜｜DSML｜｜${gap}invoke>`,
+      `</｜｜DSML｜｜${gap}calls>`,
+    ].join("");
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, splitEvery(text, 2));
+    expect(textDeltas(events)).toBe("");
+    expect(sieve.calls).toHaveLength(1);
+    expect(sieve.flush()).toEqual([]);
+  });
+});
+
+describe("StreamSieve mismatched wrappers", () => {
+  const mixed = String.raw`<tool_call>
+{"name":"RunCommand","arguments":{"command":"node -v","blocking":true,"requires_approval":false,"command_type":"short_running_process"}}
+<｜｜DSML｜｜ invoke name="RunCommand">
+<｜｜DSML｜｜ parameter name="blocking" string="false">true</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name="command" string="true">opdev help</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name="command_type" string="true">short_running_process</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name="requires_approval" string="false">false</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name="wait_ms_before_async" string="false">0</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>`;
+
+  it.each([1, 2, 5])("recovers both calls and hides orphan close tags at width %s", (w) => {
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, splitEvery(mixed, w));
+    events.push(...sieve.flush());
+    expect(textDeltas(events)).toBe("");
+    expect(toolCallsOf(events).map((call) => call.function.name)).toEqual(["RunCommand", "RunCommand"]);
+    expect(JSON.parse(toolCallsOf(events)[1]!.function.arguments)).toEqual({
+      blocking: true,
+      command: "opdev help",
+      command_type: "short_running_process",
+      requires_approval: false,
+      wait_ms_before_async: 0,
+    });
+  });
+
+  it("does not mistake a heart-like </3 fragment for a close tag", () => {
+    const sieve = new StreamSieve();
+    expect(sieve.feed("love </3 yeah")).toEqual([{ type: "text", delta: "love </3 yeah" }]);
+    expect(sieve.flush()).toEqual([]);
+  });
 });
 
 describe("StreamSieve bare JSON", () => {
@@ -234,5 +300,139 @@ describe("StreamSieve bare JSON", () => {
     expect(textDeltas(events)).toBe("");
     expect(toolCallsOf(events)).toHaveLength(1);
     expect(sieve.calls[0]?.function.name).toBe("Grep");
+  });
+
+  it("recovers a call when the opener name drifts into THINK, leaving <>", () => {
+    const body = '{"name":"TodoWrite","arguments":{"merge":true,"todos":[]}}';
+    const sieve = new StreamSieve("seed", [
+      { name: "TodoWrite", paramKeys: ["todos", "merge"] },
+    ]);
+    const events = feedChunks(sieve, ["<", ...splitEvery(`>\n${body}\n</call>`, 12)]);
+    events.push(...sieve.flush());
+    expect(textDeltas(events)).toBe("");
+    expect(toolCallsOf(events)).toHaveLength(1);
+    expect(sieve.calls[0]?.function.name).toBe("TodoWrite");
+  });
+
+  it("recovers a command containing unescaped inner double quotes", () => {
+    const body = '{"name":"RunCommand","arguments":{"command":"python -c "print(\'ok\')"","blocking":true}}';
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, splitEvery(`<tool_call>\n${body}\n</tool_call>`, 13));
+    events.push(...sieve.flush());
+    expect(textDeltas(events)).toBe("");
+    expect(toolCallsOf(events)).toHaveLength(1);
+    expect(JSON.parse(sieve.calls[0]?.function.arguments ?? "{}")).toEqual({
+      command: "python -c \"print('ok')\"",
+      blocking: true,
+    });
+  });
+
+  it("recovers a Write call whose content embeds triple-quoted source", () => {
+    const embedded =
+      '"""主题包 + Planner 单元测试。\n' +
+      'THEME_FIELDS = {\n"theme_key", "festival", "title",\n}\n' +
+      'payload = json.loads(prompt.split("\\n", 1)[1])\n' +
+      'assert "base_missions" not in payload, "prompt 不能携带成稿任务"\n"';
+    const body = '{"name":"Write","arguments":{"file_path":"f:\\workspace\\play-together\\backend\\tests\\t.py",' +
+      `"content":"${embedded}"}}`;
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, splitEvery(`<tool_call>\n${body}\n</tool_call>`, 11));
+    events.push(...sieve.flush());
+    expect(textDeltas(events)).toBe("");
+    expect(toolCallsOf(events)).toHaveLength(1);
+    expect(JSON.parse(sieve.calls[0]?.function.arguments ?? "{}")).toEqual({
+      file_path: "f:\\workspace\\play-together\\backend\\tests\\t.py",
+      content: embedded,
+    });
+  });
+
+  const parallel = [
+    '{"name":"read","arguments":{"path":"a.ts"}}',
+    '{"name":"bash","arguments":{"command":"ls"}}',
+    '{"name":"Grep","arguments":{"pattern":"x"}}',
+  ];
+
+  it("recovers space-separated bare objects one char at a time with no leaks", () => {
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, splitEvery(parallel.join(" "), 1));
+    events.push(...sieve.flush());
+    expect(textDeltas(events)).toBe("");
+    expect(toolCallsOf(events).map((call) => call.function.name)).toEqual(["read", "bash", "Grep"]);
+  });
+
+  it("recovers comma-separated bare objects without leaking the commas", () => {
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, splitEvery(parallel.join(","), 3));
+    events.push(...sieve.flush());
+    expect(textDeltas(events)).toBe("");
+    expect(toolCallsOf(events)).toHaveLength(3);
+  });
+});
+
+describe("StreamSieve plain-XML invoke protocol", () => {
+  const openTag = (tag: string, attrs = ""): string => "<" + tag + attrs + ">";
+  const closeTag = (tag: string): string => "</" + tag + ">";
+  const parameter = (name: string, body: string): string =>
+    openTag("parameter", ` name="${name}"`) + body + closeTag("parameter");
+
+  it("hides a call-wrapped invoke fed in tiny chunks and emits its tool call", () => {
+    const path = "c:\\Users\\研发部\\plugins\\lark\\1.0.5\\lark-base-workflow-schema.md";
+    const stanza = openTag("call") + " " + openTag("invoke", ' name="Read"') + " " +
+      parameter("file_path", path) + closeTag("invoke") + " " + closeTag("call");
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, splitEvery(stanza, 7));
+    events.push(...sieve.flush());
+    expect(textDeltas(events)).toBe("");
+    expect(toolCallsOf(events)).toHaveLength(1);
+    expect(sieve.calls[0]?.function.name).toBe("Read");
+    expect(sieve.calls[0]?.function.arguments).toBe(JSON.stringify({ file_path: path }));
+  });
+
+  it("captures a standalone invoke without a call wrapper", () => {
+    const stanza = openTag("invoke", ' name="Bash"') + parameter("command", "ls -la") + closeTag("invoke");
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, splitEvery(stanza, 11));
+    events.push(...sieve.flush());
+    expect(textDeltas(events)).toBe("");
+    expect(toolCallsOf(events)).toHaveLength(1);
+    expect(sieve.calls[0]?.function.name).toBe("Bash");
+  });
+});
+
+describe("StreamSieve tool-result blocks", () => {
+  const block = "<tool_call_result><toolcall_status>Done</toolcall_status>" +
+    "<command_id>job-7c9a</command_id>" +
+    "<command_run_logs>81 passed in 2.51s</command_run_logs></tool_call_result>";
+
+  it("hides a result block fed in tiny chunks and stays empty on flush", () => {
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, splitEvery(block, 3));
+    expect(textDeltas(events)).toBe("");
+    expect(toolCallsOf(events)).toEqual([]);
+    expect(sieve.flush()).toEqual([]);
+    expect(parseToolCalls(sieve.fullOutput.join(""))).toEqual({ content: "", toolCalls: [] });
+  });
+
+  it("releases prose preceding a result block but hides the block", () => {
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, ["Done.", block]);
+    expect(textDeltas(events)).toBe("Done.");
+    expect(sieve.flush()).toEqual([]);
+  });
+});
+
+describe("StreamSieve tool key and malformed DSML", () => {
+  const winPath = String.raw`d:\tmp\tijian`;
+  const turn = `<_call>\n{"tool": "LS", "arguments": {"path": "${winPath}"}}\n</_call>\n` +
+    `<｜｜DSML｜｜ calls>\n{"tool": "Grep", "arguments": {"pattern": "M6", ` +
+    `"path": "${winPath}", "output_mode": "files_with_matches"}}\n` +
+    `</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>`;
+
+  it("recovers both malformed calls char by char without leaking protocol", () => {
+    const sieve = new StreamSieve();
+    const events = feedChunks(sieve, splitEvery(turn, 1));
+    events.push(...sieve.flush());
+    expect(textDeltas(events)).toBe("");
+    expect(toolCallsOf(events).map((call) => call.function.name)).toEqual(["LS", "Grep"]);
   });
 });

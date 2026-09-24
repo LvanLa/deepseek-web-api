@@ -195,7 +195,9 @@ data: {"type":"error","code":"deepseek_web_error","message":"...","param":null}
 
 ```
 
-No fabricated `response.completed` event is sent after an error.
+No fabricated `response.completed` event is sent after an error. When DeepSeek
+embeds an error frame inside an otherwise successful SSE stream (content policy,
+context overflow, stale session), the message carries the upstream text verbatim.
 
 ## Compatibility limits
 

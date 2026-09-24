@@ -39,9 +39,10 @@ function parseBlock(block: string): DeepSeekSseEvent | null {
     else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
   }
   if (dataLines.length === 0) return null;
+  const raw = dataLines.join("\n");
   try {
-    const parsed: unknown = JSON.parse(dataLines.join("\n"));
-    return isRecord(parsed) ? { event, data: parsed } : null;
+    const parsed: unknown = JSON.parse(raw);
+    return isRecord(parsed) ? { event, data: parsed, raw } : null;
   } catch {
     // Ignore malformed frames instead of corrupting the remaining stream.
     return null;

@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import { isRecord } from "../utils/json.js";
 import { collectJsonObjects, looksLikeToolJson } from "./toolCallJson.js";
 import { parseDsmlProtocol, bareWrapperResidueOnly, stripBareWrapperTags, stripDsmlTags } from "./dsmlToolCalls.js";
+import { parseXmlInvokeProtocol, stripXmlInvokeTags } from "./xmlToolCalls.js";
+import { parseResultProtocol, stripResultTags } from "./toolResultTags.js";
 
 export interface OpenAIToolCall {
   id: string;
@@ -23,8 +25,10 @@ interface PayloadCandidate {
 interface TagBlock extends Range { bodyStart: number; bodyEnd: number; attributes: string }
 
 const TOOL_TAG = /<\s*(\/?)\s*(tool[_-]?call|_?call)\b([^>]*)>/gi;
+// Degenerate opener "<>" left when the tag name drifts into the THINK channel.
+const EMPTY_ANGLE = /<\s*>/g;
 // Partial DSML fragment at the end of a recovered block (close tag cut mid-way).
-const PARTIAL_DSML = /<\/?[｜]{1,2}(?:DSML(?:[｜]{1,2}[ \t]*[a-z_]*)?|[DSML]{0,4})\s*$/i;
+const PARTIAL_DSML = /<\/?[｜]{1,2}(?:DSML(?:[｜]{1,2}\s*[a-z_]*)?|[DSML]{0,4})\s*$/i;
 // Native DSML invokes are parsed in dsmlToolCalls.ts.
 
 function stableValue(value: unknown): unknown {
@@ -39,17 +43,12 @@ export function stableJson(value: unknown, pretty = false): string {
 
 function argumentObject(value: unknown): Record<string, unknown> | null {
   if (isRecord(value)) {
-    if (isRecord(value.arguments) && Object.keys(value).length === 1) {
-      return argumentObject(value.arguments);
-    }
-    return value;
+    return isRecord(value.arguments) && Object.keys(value).length === 1
+      ? argumentObject(value.arguments)
+      : value;
   }
   if (typeof value !== "string") return value === undefined ? {} : null;
-  try {
-    return argumentObject(JSON.parse(value));
-  } catch {
-    return null;
-  }
+  try { return argumentObject(JSON.parse(value)); } catch { return null; }
 }
 
 /**
@@ -79,14 +78,15 @@ function callPayload(
   const nested = isRecord(value.function) ? value.function : value;
   const name =
     (typeof nested.name === "string" ? nested.name.trim() : "") ||
+    (typeof nested.tool === "string" ? nested.tool.trim() : "") ||
     (typeof value.name === "string" ? value.name.trim() : "") ||
     attributeName.trim();
   let argumentsValue = argumentObject(nested.arguments);
   if (!argumentsValue) {
     const rest = Object.fromEntries(
-      Object.entries(nested).filter(([key]) => key !== "name" && key !== "function"),
+      Object.entries(nested).filter(([key]) => key !== "name" && key !== "tool" && key !== "function"),
     );
-    argumentsValue = Object.keys(rest).length > 0 ? argumentObject(rest) : null;
+    argumentsValue = Object.keys(rest).length ? argumentObject(rest) : null;
   }
   if (name && argumentsValue) return { name, arguments: argumentsValue };
   if (!name && argumentsValue) {
@@ -114,20 +114,18 @@ function attributeName(attributes: string): string {
 
 function tagBlocks(text: string): TagBlock[] {
   TOOL_TAG.lastIndex = 0;
-  const tags = [...text.matchAll(TOOL_TAG)].map((match) => ({
-    start: match.index ?? 0, end: (match.index ?? 0) + match[0].length,
-    closing: Boolean(match[1]), attributes: match[3] ?? "",
-  }));
+  const tags = [...text.matchAll(TOOL_TAG)].map((match) => {
+    const start = match.index ?? 0;
+    return { start, end: start + match[0].length, closing: Boolean(match[1]), attributes: match[3] ?? "" };
+  });
   const blocks: TagBlock[] = [];
   for (let index = 0; index < tags.length; index += 1) {
-    const open = tags[index];
-    if (!open || open.closing) continue;
+    const open = tags[index]!;
+    if (open.closing) continue;
     const next = tags[index + 1];
     if (next && !next.closing) continue;
-    blocks.push({
-      start: open.start, end: next?.end ?? text.length,
-      bodyStart: open.end, bodyEnd: next?.start ?? text.length, attributes: open.attributes,
-    });
+    blocks.push({ start: open.start, end: next?.end ?? text.length,
+      bodyStart: open.end, bodyEnd: next?.start ?? text.length, attributes: open.attributes });
     if (next) index += 1;
   }
   return blocks;
@@ -137,11 +135,16 @@ function overlaps(range: Range, blocked: readonly Range[]): boolean {
   return blocked.some((item) => range.start < item.end && range.end > item.start);
 }
 
+function matchRanges(text: string, pattern: RegExp): Range[] {
+  pattern.lastIndex = 0;
+  return [...text.matchAll(pattern)].map((match) =>
+    ({ start: match.index ?? 0, end: (match.index ?? 0) + match[0].length }));
+}
+
 function removeRanges(text: string, ranges: readonly Range[]): string {
   const sorted = [...ranges].filter((range) => range.end > range.start)
     .sort((left, right) => left.start - right.start || right.end - left.end);
-  let content = "";
-  let cursor = 0;
+  let content = "", cursor = 0;
   for (const range of sorted) {
     if (range.end <= cursor) continue;
     content += text.slice(cursor, Math.max(cursor, range.start));
@@ -155,9 +158,14 @@ function withoutToolTags(text: string): string {
   return text.replace(TOOL_TAG, "");
 }
 
-function protocolOnly(text: string, ranges: readonly Range[], dsmlPresent = false): boolean {
-  const stripped = withoutToolTags(removeRanges(text, ranges));
-  return (dsmlPresent ? stripDsmlTags(stripped) : stripped).trim().length === 0;
+function protocolOnly(text: string, ranges: readonly Range[], dsmlPresent = false,
+  bareSeparators = false, xmlPresent = false, resultPresent = false): boolean {
+  let residue = withoutToolTags(removeRanges(text, ranges));
+  if (dsmlPresent) residue = stripDsmlTags(residue);
+  if (xmlPresent) residue = stripXmlInvokeTags(residue);
+  if (resultPresent) residue = stripResultTags(residue);
+  if (bareSeparators) residue = residue.replace(/[\s,]+/g, "");
+  return residue.length === 0;
 }
 
 function pushUnique(
@@ -202,60 +210,66 @@ function taggedCandidates(
 export function parseToolCalls(
   text: string, seed = "tool", hints: ParseToolHints = {},
 ): ParsedToolCalls {
-  const tools = hints.tools ?? [];
-  const blocks = tagBlocks(text);
+  const tools = hints.tools ?? []; const blocks = tagBlocks(text);
   const tagged = taggedCandidates(text, blocks, tools);
   const dsml = parseDsmlProtocol(text);
-  const blocked: readonly Range[] = [...blocks, ...dsml.ranges];
+  const xml = parseXmlInvokeProtocol(text);
+  const result = parseResultProtocol(text);
+  const blocked: readonly Range[] = [...blocks, ...dsml.ranges, ...xml.ranges, ...result.ranges];
   const bareObjects = collectJsonObjects(text).filter(
     (object) => !overlaps({ start: object.start, end: object.end }, blocked),
   );
   const bareRanges = bareObjects
     .filter((object) => looksLikeToolJson(object.raw))
     .map((object) => ({ start: object.start, end: object.end }));
-  const sweepRanges = [...blocks, ...dsml.ranges, ...bareRanges];
-  const bareContext = protocolOnly(text, sweepRanges, dsml.present);
+  // Empty angle pairs count as residue only when a tool-shaped JSON is present.
+  const emptyRanges = bareRanges.length > 0 ? matchRanges(text, EMPTY_ANGLE) : [];
+  const sweepRanges = [...blocks, ...dsml.ranges, ...xml.ranges, ...result.ranges, ...bareRanges, ...emptyRanges];
+  const bareContext = protocolOnly(text, sweepRanges, dsml.present, true, xml.present, result.present);
+  // Gaps between bare objects are their separators; remove them with the calls.
+  const bareGapRanges: Range[] = bareContext
+    ? bareRanges.slice(1).map((range, index) => ({ start: bareRanges[index]!.end, end: range.start })) : [];
   const bareCalls: PayloadCandidate[] = bareContext
     ? bareObjects.flatMap((object) => {
         const payload = callPayload(object.value, "", tools);
-        return payload
-          ? [{ order: object.start, consume: { start: object.start, end: object.end }, payload }]
-          : [];
+        return payload ? [{ order: object.start, consume: { start: object.start, end: object.end }, payload }] : [];
       })
     : [];
-  const candidates = [...tagged.calls, ...dsml.calls, ...bareCalls].sort(
-    (left, right) => left.order - right.order,
-  );
+  const candidates = [...tagged.calls, ...dsml.calls, ...xml.calls, ...bareCalls]
+    .sort((left, right) => left.order - right.order);
   const toolCalls: OpenAIToolCall[] = [];
   const seen = new Set<string>();
   for (const candidate of candidates) pushUnique(toolCalls, seed, candidate.payload, seen);
 
   const artifactRanges = [...tagged.artifacts, ...bareRanges];
   const residueOnly = !dsml.present && bareWrapperResidueOnly(text);
-  const stripProtocolTags = dsml.present || residueOnly;
+  const stripProtocolTags = dsml.present || xml.present || result.present || residueOnly;
   const isProtocolOnly =
     (artifactRanges.length > 0 || stripProtocolTags) &&
-    protocolOnly(text, sweepRanges, stripProtocolTags);
-  if (toolCalls.length === 0 && !isProtocolOnly && !stripProtocolTags) {
-    return { content: text, toolCalls };
-  }
+    protocolOnly(text, sweepRanges, stripProtocolTags, false, xml.present, result.present);
+  if (toolCalls.length === 0 && !isProtocolOnly && !stripProtocolTags) return { content: text, toolCalls };
+
   const consumed = candidates.map((candidate) => candidate.consume);
   const withoutArtifacts = removeRanges(text, [
-    ...consumed,
-    ...(toolCalls.length > 0 ? blocks : []),
+    ...consumed, ...(toolCalls.length > 0 ? blocks : []),
     ...(bareContext || isProtocolOnly ? artifactRanges : []),
-    ...(dsml.present ? dsml.ranges : []),
+    ...(bareContext ? emptyRanges : []), ...(bareContext ? bareGapRanges : []),
+    ...(dsml.present ? dsml.ranges : []), ...(xml.present ? xml.ranges : []),
+    ...(result.present ? result.ranges : []),
   ]);
-  // Strip DSML tags when the protocol was present or a call was recovered,
+  // Strip protocol tags when the family was present or a call was recovered,
   // even if the wrapper closer survived alone as an orphan tag.
-  const withoutMarkup = withoutToolTags(
-    dsml.present || toolCalls.length > 0 ? stripDsmlTags(withoutArtifacts) : withoutArtifacts,
-  );
+  const needsStrip = dsml.present || xml.present || result.present || toolCalls.length > 0;
+  const strippedTags = needsStrip
+    ? stripResultTags(stripXmlInvokeTags(stripDsmlTags(withoutArtifacts)))
+    : withoutArtifacts;
+  const withoutMarkup = withoutToolTags(strippedTags);
   // Bare wrapper residue can prefix ordinary <tool_call> blocks too.
   const withoutResidue =
     toolCalls.length > 0 || residueOnly ? stripBareWrapperTags(withoutMarkup) : withoutMarkup;
   const withoutPartial = toolCalls.length > 0 ? withoutResidue.replace(PARTIAL_DSML, "") : withoutResidue;
-  const cleaned = withoutPartial.replace(/\n{3,}/g, "\n\n").trim();
+  const withoutEmpty = toolCalls.length > 0 ? withoutPartial.replace(/^\s*<\s*>/, "") : withoutPartial;
+  const cleaned = withoutEmpty.replace(/\n{3,}/g, "\n\n").trim();
   return { content: cleaned, toolCalls };
 }
 
@@ -266,9 +280,7 @@ export function parseToolCallsFromParts(
   const fromOutput = parseToolCalls(outputText, seed, hints);
   if (fromOutput.toolCalls.length > 0) return fromOutput;
   const fromReasoning = parseToolCalls(reasoningText, seed, hints);
-  if (fromReasoning.toolCalls.length > 0) {
-    return { content: fromOutput.content, toolCalls: fromReasoning.toolCalls };
-  }
+  if (fromReasoning.toolCalls.length > 0) { return { content: fromOutput.content, toolCalls: fromReasoning.toolCalls }; }
   return outputText.trim() ? fromOutput : fromReasoning;
 }
 

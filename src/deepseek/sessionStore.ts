@@ -7,7 +7,6 @@ import { stripBareWrapperTags } from "./dsmlToolCalls.js";
 import { SessionFile } from "./sessionFile.js";
 import { fingerprint, fpKey, foldTurns, turnsEqual, turnsPrefix, turnsSuffix } from "./sessionTurns.js";
 import type { MessageTurn, ModelType, RequestBody } from "./types.js";
-
 const MAX_SESSIONS = 500;
 const MAX_TURNS = 40;
 const HASHED_FP_KEY = /^fp:[0-9a-f]{64}$/;
@@ -20,7 +19,6 @@ function requestWindow(turns: readonly MessageTurn[], cap: number): MessageTurn[
   if (start >= turns.length) start = turns.length - cap;
   return turns.slice(start).map((turn) => ({ ...turn }));
 }
-
 export type MessageId = string | number | null;
 export interface SessionEntry {
   lastResponseMessageId: MessageId;
@@ -33,11 +31,10 @@ export interface ConversationResolution {
   pendingFingerprint?: string; createIfMissing?: boolean;
 }
 /** Exclude the trailing request turn because it is not stored history yet. */
-function historyTurns(messages: unknown): MessageTurn[] {
-  if (!Array.isArray(messages)) return [];
+const historyTurns = (messages: unknown): MessageTurn[] => {
   const turns = requestConversationTurns({ messages });
   return turns.at(-1)?.role === "assistant" ? turns : turns.slice(0, -1);
-}
+};
 function metadata(body: RequestBody): Record<string, unknown> {
   return isRecord(body.metadata) ? body.metadata : {};
 }
@@ -45,7 +42,6 @@ function metadata(body: RequestBody): Record<string, unknown> {
 function stringId(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
-
 function parentId(value: unknown): MessageId {
   return typeof value === "string" || typeof value === "number" ? value : null;
 }
@@ -53,7 +49,6 @@ function parentId(value: unknown): MessageId {
 function parseModelType(value: unknown): ModelType | undefined {
   return value === "default" || value === "expert" ? value : undefined;
 }
-
 function parseSessionEntry(value: unknown): SessionEntry | null {
   if (!isRecord(value) || !Array.isArray(value.turns) || typeof value.updatedAt !== "number") return null;
   const turns: MessageTurn[] = [];
@@ -68,21 +63,19 @@ function parseSessionEntry(value: unknown): SessionEntry | null {
   const modelType = parseModelType(value.modelType);
   const instructionFingerprint = stringId(value.instructionFingerprint) ?? undefined;
   const toolsFingerprint = stringId(value.toolsFingerprint) ?? undefined;
-  return {
-    lastResponseMessageId,
-    updatedAt: value.updatedAt,
-    turns,
-    ...(lastModelType ? { lastModelType } : {}),
-    ...(modelType ? { modelType } : {}),
-    ...(instructionFingerprint ? { instructionFingerprint } : {}),
-    ...(toolsFingerprint ? { toolsFingerprint } : {}),
-  };
+  const optional: Partial<SessionEntry> = {};
+  if (lastModelType) optional.lastModelType = lastModelType;
+  if (modelType) optional.modelType = modelType;
+  if (instructionFingerprint) optional.instructionFingerprint = instructionFingerprint;
+  if (toolsFingerprint) optional.toolsFingerprint = toolsFingerprint;
+  return { lastResponseMessageId, updatedAt: value.updatedAt, turns, ...optional };
 }
 
 /** Public session index used by every completion path. */
 export class SessionStore {
   private readonly sessions = new Map<string, SessionEntry>();
   private readonly convIndex = new Map<string, string>();
+  private readonly instructionIndex = new Map<string, string>();
   private readonly storage: SessionFile;
   private readonly logger: Logger | undefined;
 
@@ -91,7 +84,6 @@ export class SessionStore {
     this.storage = new SessionFile(file, logger);
     this.load();
   }
-
   /** Flush buffered persistence and release the single-instance lock. */
   close(): void {
     this.storage.close();
@@ -100,9 +92,15 @@ export class SessionStore {
   has(sessionId: string): boolean {
     return this.sessions.has(sessionId);
   }
-
   get(sessionId: string): SessionEntry | undefined {
     return this.sessions.get(sessionId);
+  }
+
+  /** Sticky fallback: bind to the latest session reusing identical instructions. */
+  resolveInstruction(fp: string): ConversationResolution | undefined {
+    const sessionId = this.instructionIndex.get(fp);
+    if (!sessionId || !this.sessions.has(sessionId)) return undefined;
+    return this.found(sessionId, `instr:${fp.slice(0, 16)}`);
   }
 
   /** Resolve explicit IDs first, then previous response IDs, then history fingerprints. */
@@ -163,6 +161,7 @@ export class SessionStore {
     this.sessions.set(input.sessionId, entry);
     this.prune();
     if (input.convKey) this.convIndex.set(input.convKey, input.sessionId);
+    if (instructionFingerprint) this.instructionIndex.set(instructionFingerprint, input.sessionId);
     // Index folded-round fingerprints at each assistant boundary so any
     // completed logical turn can resume independently.
     const folded = foldTurns(turns);
@@ -173,7 +172,6 @@ export class SessionStore {
     }
     this.save();
   }
-
   private resolveExplicit(sessionId: string, fallbackParent: MessageId, prefix: "id" | "prev"): ConversationResolution {
     const entry = this.sessions.get(sessionId);
     return {
@@ -253,13 +251,11 @@ export class SessionStore {
       .map((model) => this.convIndex.get(fpKey(`${model}:${value}`)))
       .find((sessionId) => sessionId !== undefined);
   }
-
   private prune(): void {
     if (this.sessions.size <= MAX_SESSIONS) return;
     const oldest = [...this.sessions.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt);
     for (const [id] of oldest.slice(0, this.sessions.size - MAX_SESSIONS)) this.sessions.delete(id);
   }
-
   private load(): void {
     const raw = this.storage.read();
     if (!raw) return;
@@ -276,6 +272,11 @@ export class SessionStore {
         const indexed = key.startsWith("fp:") && !HASHED_FP_KEY.test(key) ? fpKey(key.slice(3)) : key;
         this.convIndex.set(indexed, value);
       }
+      if (isRecord(parsed.instructions)) {
+        for (const [fp, id] of Object.entries(parsed.instructions)) {
+          if (typeof id === "string" && this.sessions.has(id)) this.instructionIndex.set(fp, id);
+        }
+      }
     } catch (error) {
       this.logger?.warn("could not read sessions file; starting with an empty index", {
         error: error instanceof Error ? error.message : String(error),
@@ -288,6 +289,12 @@ export class SessionStore {
     for (const [key, sessionId] of this.convIndex) {
       if (this.sessions.has(sessionId)) convs[key] = sessionId;
     }
-    this.storage.requestSave(JSON.stringify({ sessions: Object.fromEntries(this.sessions), convs }));
+    const instructions: Record<string, string> = {};
+    for (const [fp, sessionId] of this.instructionIndex) {
+      if (this.sessions.has(sessionId)) instructions[fp] = sessionId;
+    }
+    this.storage.requestSave(JSON.stringify({
+      sessions: Object.fromEntries(this.sessions), convs, instructions,
+    }));
   }
 }

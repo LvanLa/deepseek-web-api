@@ -208,6 +208,39 @@ describe("streamToolChat", () => {
     expect(calls.map((call) => call.function?.name)).toEqual(["read", "bash"]);
     expect(calls.map((call) => call.index)).toEqual([0, 1]);
   });
+
+  it("recovers three space-separated bare objects streamed character by character", async () => {
+    const text = [
+      '{"name":"Grep","arguments":{"pattern":"GenerateActivityResponse"}}',
+      '{"name":"Grep","arguments":{"pattern":"activity_id","path":"a"}}',
+      '{"name":"Grep","arguments":{"pattern":"activity_id","path":"b"}}',
+    ].join(" ");
+    const deltas: Delta[] = [...text].map((char) => ["output", char]);
+    const sink = collect();
+    const value = await streamToolChat(run(upstream(deltas)), "hidden", "", sink.push);
+
+    const calls = toolCalls(sink.chunks);
+    expect(calls).toHaveLength(3);
+    expect(calls.map((call) => call.index)).toEqual([0, 1, 2]);
+    expect(content(sink.chunks)).toBe("");
+    expect(value.finishReason).toBe("tool_calls");
+  });
+
+  it("recovers three comma-separated bare objects leaked into THINK character by character", async () => {
+    const text = [
+      '{"name":"Grep","arguments":{"pattern":"GenerateActivityResponse"}}',
+      '{"name":"Grep","arguments":{"pattern":"activity_id","path":"a"}}',
+      '{"name":"Grep","arguments":{"pattern":"activity_id","path":"b"}}',
+    ].join(",");
+    const deltas: Delta[] = [...text].map((char) => ["reasoning", char]);
+    const sink = collect();
+    const value = await streamToolChat(run(upstream(deltas)), "hidden", "", sink.push);
+
+    const calls = toolCalls(sink.chunks);
+    expect(calls).toHaveLength(3);
+    expect(content(sink.chunks)).toBe("");
+    expect(value.finishReason).toBe("tool_calls");
+  });
 });
 
 describe("streamPlainChat", () => {

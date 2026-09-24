@@ -1,4 +1,6 @@
 /** Parses the native DeepSeek DSML tool protocol. */
+import { isRecord } from "../utils/json.js";
+import { collectJsonObjects } from "./toolCallJson.js";
 
 /*
  * The model sometimes ignores the prompted <tool_call> JSON shape and falls
@@ -49,13 +51,38 @@ interface DsmlElement {
   attributes: string;
 }
 
-const DSML_TAG = /<(\/?)[｜]{1,2}DSML[｜]{1,2}[ \t]*([a-z_]+)\b([^>]*)>/gi;
+// \s (not [ \t]) so NBSP/ideographic space between bars and the keyword do
+// not make the whole DSML block fall through as assistant content.
+const DSML_TAG = /<(\/?)[｜]{1,2}DSML[｜]{1,2}\s*([a-z_]+)\b([^>]*)>/gi;
 const DSML_ESCAPED_CLOSE =
-  /&((?:amp;)*)lt;(\/[｜]{1,2}DSML[｜]{1,2}[ \t]*parameter)>/gi;
+  /&((?:amp;)*)lt;(\/[｜]{1,2}DSML[｜]{1,2}\s*parameter)>/gi;
 // Renderers sometimes mangle the wrapper opener into plain ASCII ("< calls>")
 // while the rest stays DSML, leaving a residue tag with no full-width bars.
 const BARE_WRAPPER_TAG = /<\/?\s*(?:calls|tool_calls|function_calls)\s*>/gi;
 const DSML_WRAPPER_NAMES = new Set(["calls", "tool_calls", "function_calls"]);
+
+// Stream-level detection shared with StreamSieve. \s (not [ \t]) tolerates
+// NBSP/ideographic space before the keyword.
+export const DSML_OPEN =
+  /<[｜]{1,2}DSML[｜]{1,2}\s*(invoke|calls|tool_calls|function_calls)\b[^>]*>/gi;
+export const DSML_CLOSE =
+  /<\/[｜]{1,2}DSML[｜]{1,2}\s*(invoke|calls|tool_calls|function_calls)\b[^>]*>/gi;
+export const DSML_INVOKE_OPEN = /<[｜]{1,2}DSML[｜]{1,2}\s*invoke\b[^>]*>/i;
+export const DSML_INVOKE_CLOSE = /<\/[｜]{1,2}DSML[｜]{1,2}\s*invoke\b[^>]*>/i;
+export const DSML_WRAPPER_CLOSE =
+  /<\/[｜]{1,2}DSML[｜]{1,2}\s*(calls|tool_calls|function_calls)\b[^>]*>/i;
+export const DSML_WRAPPER_NAME_LIST = ["calls", "tool_calls", "function_calls"] as const;
+
+/** DSML opener prefix (close angle not required yet) for a wrapper name. */
+export function dsmlPrefix(name: string): RegExp {
+  return new RegExp(`<[｜]{1,2}DSML[｜]{1,2}\\s*${name}\\b`, "i");
+}
+
+/** Matching wrapper close in DSML form or ASCII-mangled form. */
+export function dsmlBlockClose(name: string): RegExp {
+  return new RegExp(
+    `(?:</[｜]{1,2}DSML[｜]{1,2}\\s*${name}\\b[^>]*>|<\\s*\\/\\s*${name}\\s*>)`, "i");
+}
 
 /** Remove every DSML tag and any ASCII wrapper residue, leaving plain text. */
 export function stripDsmlTags(text: string): string {
@@ -188,10 +215,11 @@ function dsmlParameterValue(raw: string, stringAttribute: string | undefined): u
 /** Extract native DSML invokes plus the ranges that must never reach the user. */
 export function parseDsmlProtocol(text: string): DsmlParse {
   const tokens = dsmlTokens(text);
-  const present = tokens.some((token) => token.kind === "invoke");
+  const wrappers = dsmlElements(text, tokens, "wrapper");
+  // A wrapper opener alone (stream truncated, no invoke tags) still counts.
+  const present = tokens.some((token) => token.kind === "invoke") || wrappers.length > 0;
   if (!present) return { present, calls: [], ranges: [] };
 
-  const wrappers = dsmlElements(text, tokens, "wrapper");
   const invokes = dsmlElements(text, tokens, "invoke");
   // Accept invoke closes as parameter bounds for malformed streams.
   const parameters = dsmlElements(text, tokens, "parameter", ["parameter", "invoke"]);
@@ -245,15 +273,28 @@ export function parseDsmlProtocol(text: string): DsmlParse {
     const name = precedingInvokeName(tokens, parameter.range.start);
     const parameterName = attributeValue(parameter.attributes, "name");
     if (!name || !parameterName) continue;
-    const value = dsmlParameterValue(
-      text.slice(parameter.bodyStart, parameter.bodyEnd),
-      attributeValue(parameter.attributes, "string") || undefined,
-    );
-    calls.push({
-      order: parameter.range.start,
-      consume: parameter.range,
-      payload: { name, arguments: { [parameterName]: value } },
-    });
+    const value = dsmlParameterValue(text.slice(parameter.bodyStart, parameter.bodyEnd),
+      attributeValue(parameter.attributes, "string") || undefined);
+    calls.push({ order: parameter.range.start, consume: parameter.range,
+      payload: { name, arguments: { [parameterName]: value } } });
+  }
+  // Malformed wrapper whose body is bare JSON (no invoke opener, shifted
+  // close tags): recover tool-shaped objects from the wrapper body directly.
+  for (const wrapper of wrappers) {
+    // Only malformed wrappers (no invoke opener inside) get bare recovery.
+    const hasInvoke = invokes.some((invoke) =>
+      invoke.range.start >= wrapper.range.start && invoke.range.end <= wrapper.range.end);
+    if (hasInvoke) continue;
+    const body = text.slice(wrapper.bodyStart, wrapper.bodyEnd);
+    for (const object of collectJsonObjects(body, true)) {
+      if (!isRecord(object.value)) continue;
+      const rawName = object.value.name ?? object.value.tool;
+      const name = typeof rawName === "string" ? rawName.trim() : "";
+      const args = isRecord(object.value.arguments) ? object.value.arguments : null;
+      if (!name || !args) continue;
+      calls.push({ order: wrapper.range.start + object.start, consume: wrapper.range,
+        payload: { name, arguments: args } });
+    }
   }
   return { present, calls, ranges };
 }

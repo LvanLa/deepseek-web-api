@@ -1,16 +1,25 @@
 /** Incrementally separates visible prose from complete tool-call blocks. */
 import { parseToolCalls, type OpenAIToolCall, type ParsedToolCalls, type ToolDefHint } from "./toolCalls.js";
+import {
+  DSML_CLOSE,
+  DSML_INVOKE_CLOSE,
+  DSML_INVOKE_OPEN,
+  DSML_OPEN,
+  DSML_WRAPPER_CLOSE,
+  DSML_WRAPPER_NAME_LIST,
+  dsmlBlockClose,
+  dsmlPrefix,
+} from "./dsmlToolCalls.js";
+import { XML_INVOKE_CLOSE, XML_INVOKE_OPEN } from "./xmlToolCalls.js";
+import { RESULT_CLOSE, RESULT_OPEN } from "./toolResultTags.js";
 
-export type SieveEvent =
-  | { type: "text"; delta: string }
+export type SieveEvent = { type: "text"; delta: string }
   | { type: "toolCalls"; calls: OpenAIToolCall[]; content: string };
 
 const MAX_CAPTURE_BUFFER = 1024 * 1024;
 
 const LOOSE_OPEN = /<\s*(?:tool[_-]?call|_?call)\b[^>]*>/gi;
 const LOOSE_CLOSE = /<\s*\/\s*(?:tool[_-]?call|_?call)\b[^>]*>/gi;
-const DSML_OPEN = /<[｜]{1,2}DSML[｜]{1,2}[ \t]*(invoke|calls|tool_calls|function_calls)\b[^>]*>/gi;
-const DSML_CLOSE = /<\/[｜]{1,2}DSML[｜]{1,2}[ \t]*(invoke|calls|tool_calls|function_calls)\b[^>]*>/gi;
 const BARE_WRAPPER_OPEN = /<\s*(calls|tool_calls|function_calls)\s*>/gi;
 const BARE_WRAPPER_CLOSE = /<\s*\/\s*(calls|tool_calls|function_calls)\s*>/gi;
 
@@ -30,18 +39,25 @@ function lastMatchEnd(pattern: RegExp, text: string): number {
 
 /** Earliest index where any tool-call opener could begin, or -1. */
 function findOpener(text: string): number {
-  const indexes = [LOOSE_OPEN, DSML_OPEN, BARE_WRAPPER_OPEN].map((pattern) => {
+  const patterns = [LOOSE_OPEN, DSML_OPEN, BARE_WRAPPER_OPEN, XML_INVOKE_OPEN, RESULT_OPEN];
+  const indexes = patterns.flatMap((pattern) => {
     pattern.lastIndex = 0;
-    return pattern.exec(text)?.index ?? -1;
-  }).filter((index) => index >= 0);
+    const index = pattern.exec(text)?.index ?? -1;
+    return index >= 0 ? [index] : [];
+  });
   return indexes.length ? Math.min(...indexes) : -1;
 }
 
-const OPENER_KEYWORDS = [
-  "tool_call", "tool-call", "toolcall", "tool_calls",
-  "call", "calls", "_call", "function_calls",
-];
+/** Length of leading orphan protocol close-tag residue, separators allowed, or 0. */
+function orphanCloseLead(text: string): number {
+  const tag = "</(?:[｜]{1,2}DSML[｜]{1,2}\\s*[a-z_]+|\\s*(?:calls|tool_calls|function_calls|tool[_-]?call|_?call|invoke|parameter|tool[ _-]?call[ _-]?result|call[ _-]?result|command_id|command_status|command_run_logs|process_id|terminal_id)\\b)[^>]*>";
+  return text.match(new RegExp(`^[\\s,]*(?:${tag}[\\s,]*)+`))?.[0].length ?? 0;
+}
+
+const OPENER_KEYWORDS = ["tool_call", "tool-call", "toolcall", "tool_calls", "call", "calls", "_call", "function_calls"];
 const DSML_KEYWORDS = ["invoke", "calls", "tool_calls", "function_calls"];
+const XML_KEYWORDS = ["invoke", "parameter"];
+const RESULT_KEYWORDS = ["tool_call_result", "toolcall_result", "tool-result", "call_result"];
 
 /** True while ``rest`` is still a prefix of ``keyword`` or its partial attrs. */
 function keywordOrAttrs(keyword: string, rest: string, leadingSpace = false): boolean {
@@ -51,35 +67,37 @@ function keywordOrAttrs(keyword: string, rest: string, leadingSpace = false): bo
   return new RegExp(`^${escaped}(?:\\s[^<>]*)?$`).test(body);
 }
 
-/** A trailing "<..." suffix that could still grow into a tool-call opener. */
+/** A trailing "<..." suffix that could still grow into an opener or closer. */
 function couldStartTag(tail: string): boolean {
   if (!tail.startsWith("<")) return false;
   const rest = tail.slice(1).replace(/^\s+/, "").toLowerCase();
   if (!rest) return true;
-  if (rest[0] === "｜") {
-    // Bars, DSML, a second bar group, optional whitespace, and the keyword or
-    // attrs may each arrive in their own network chunk; hold any such prefix.
-    const head = rest.match(/^｜{1,2}dsml(?:｜{1,2})?/)?.[0];
-    if (!head) return /^｜{0,2}(?:d|ds|dsm|dsml)?$/.test(rest);
-    return DSML_KEYWORDS.some((word) => keywordOrAttrs(word, rest.slice(head.length), true));
+  const closing = rest.startsWith("/");
+  const body = rest.slice(closing ? 1 : 0);
+  if (body[0] === "｜") {
+    const head = body.match(/^｜{1,2}dsml(?:｜{1,2})?/)?.[0];
+    if (!head) return /^｜{0,2}(?:d|ds|dsm|dsml)?$/.test(body);
+    const after = body.slice(head.length).replace(/^\s+|>$/g, "");
+    return after === "" || DSML_KEYWORDS.some((w) => keywordOrAttrs(w, after, true));
   }
-  return OPENER_KEYWORDS.some((keyword) => keywordOrAttrs(keyword, rest));
+  if (closing) return OPENER_KEYWORDS.some((k) => k.startsWith(body.replace(/>$/, ""))) ||
+    OPENER_KEYWORDS.some((k) => new RegExp(`^${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^<>]*>$`).test(body)) ||
+    XML_KEYWORDS.some((k) => keywordOrAttrs(k, body)) ||
+    RESULT_KEYWORDS.some((k) => keywordOrAttrs(k, body));
+  return OPENER_KEYWORDS.some((k) => keywordOrAttrs(k, body)) ||
+    XML_KEYWORDS.some((k) => keywordOrAttrs(k, body)) ||
+    RESULT_KEYWORDS.some((k) => keywordOrAttrs(k, body));
 }
 
 /** Index just past a balanced top-level JSON object starting at ``start``, or -1. */
 function jsonObjectEnd(text: string, start: number): number {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = start; index < text.length; index += 1) {
-    const char = text[index] ?? "";
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (char === "\\") escaped = true;
-      else if (char === '"') inString = false;
-    } else if (char === '"') inString = true;
+  let depth = 0, inString = false, escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const char = text[i]!;
+    if (inString) { if (escaped) escaped = false; else if (char === "\\") escaped = true; else inString = char !== '"'; }
+    else if (char === '"') inString = true;
     else if (char === "{") depth += 1;
-    else if (char === "}" && --depth === 0) return index + 1;
+    else if (char === "}" && --depth === 0) return i + 1;
   }
   return -1;
 }
@@ -88,34 +106,28 @@ function jsonObjectEnd(text: string, start: number): number {
 export class StreamSieve {
   readonly fullOutput: string[] = [];
   private readonly emittedCalls: OpenAIToolCall[] = [];
-  private pending = "";
-  private capture = "";
-  private captureKind: CaptureKind | null = null;
-  private nonWhitespaceReleased = false;
+  private pending = ""; private capture = "";
+  private captureKind: CaptureKind | null = null; private nonWhitespaceReleased = false;
 
   constructor(private readonly seed = "tool", private readonly toolHints: readonly ToolDefHint[] = []) {}
-
   /** Tool calls already committed by this sieve, in emission order. */
   get calls(): OpenAIToolCall[] { return this.emittedCalls; }
 
   feed(chunk: string): SieveEvent[] {
     if (!chunk) return [];
     this.fullOutput.push(chunk);
+    if (this.captureKind === null) { this.pending += chunk; return this.drainPending(); }
     const events: SieveEvent[] = [];
-    if (this.captureKind !== null) {
-      this.capture += chunk;
-      if (this.releaseOversized(events)) return events;
-      const jsonEnd = this.captureKind === "json" ? jsonObjectEnd(this.capture, 0) : -1;
-      if (this.captureKind === "tag" ? this.captureComplete() : jsonEnd >= 0) {
-        const committed = this.captureKind === "tag"
-          ? this.commitTagCapture()
-          : this.commitJsonCapture(jsonEnd);
-        events.push(...committed, ...this.drainPending());
-      }
-      return events;
+    this.capture += chunk;
+    if (this.releaseOversized(events)) return events;
+    const jsonEnd = this.captureKind === "json" ? jsonObjectEnd(this.capture, 0) : -1;
+    if (this.captureKind === "tag" ? this.captureComplete() : jsonEnd >= 0) {
+      events.push(
+        ...(this.captureKind === "tag" ? this.commitTagCapture() : this.commitJsonCapture(jsonEnd)),
+        ...this.drainPending(),
+      );
     }
-    this.pending += chunk;
-    return this.drainPending();
+    return events;
   }
 
   /**
@@ -131,10 +143,7 @@ export class StreamSieve {
       const snapshot = this.pending;
       events.push(...this.drainPending());
       this.releaseCapture(events);
-      if (this.pending === snapshot) {
-        this.addText(events, snapshot);
-        this.pending = "";
-      }
+      if (this.pending === snapshot) { this.addText(events, snapshot); this.pending = ""; }
     }
     return events;
   }
@@ -142,27 +151,30 @@ export class StreamSieve {
   private drainPending(): SieveEvent[] {
     const events: SieveEvent[] = [];
     while (this.pending) {
+      // Strip orphan close-tag residue from mismatched wrappers; never prose.
+      const orphan = orphanCloseLead(this.pending);
+      if (orphan) { this.pending = this.pending.slice(orphan); continue; }
       const opener = findOpener(this.pending);
-      if (opener >= 0) {
-        this.addText(events, this.pending.slice(0, opener));
-        this.startCapture("tag", this.pending.slice(opener));
-        if (this.releaseOversized(events)) return events;
-        if (this.captureComplete()) events.push(...this.commitTagCapture());
-        else return events;
+      const emptyFollows = /^<\s*>\s*(?:\{|<\s*\/)/.test(this.pending);
+      const startAt = opener >= 0 ? opener : emptyFollows ? 0 : -1;
+      if (startAt >= 0) {
+        const prefix = this.pending.slice(0, startAt);
+        if (this.nonWhitespaceReleased || /[^\s,]/.test(prefix)) this.addText(events, prefix);
+        this.startCapture("tag", this.pending.slice(startAt));
+        if (this.releaseOversized(events) || !this.captureComplete()) return events;
+        events.push(...this.commitTagCapture(), ...this.drainPending());
+        return events;
       }
-      if (!this.nonWhitespaceReleased) {
-        const brace = this.pending.match(/^\s*\{/);
-        if (brace) {
-          const braceIndex = (brace.index ?? 0) + brace[0].length - 1;
-          this.addText(events, this.pending.slice(0, braceIndex));
-          this.startCapture("json", this.pending.slice(braceIndex));
-          if (this.releaseOversized(events)) return events;
-          const end = jsonObjectEnd(this.capture, 0);
-          if (end >= 0) events.push(...this.commitJsonCapture(end));
-          else return events;
-        }
+      const lead = !this.nonWhitespaceReleased ? this.pending.match(/^[\s,]*(?=\{)/) : null;
+      if (lead) {
+        this.startCapture("json", this.pending.slice(lead[0].length));
+        if (this.releaseOversized(events)) return events;
+        const end = jsonObjectEnd(this.capture, 0);
+        if (end >= 0) events.push(...this.commitJsonCapture(end));
+        return events;
       }
       const [safe, hold] = this.splitSafe(this.pending);
+      if (!this.nonWhitespaceReleased && !/[^\s,]/.test(safe)) { if (hold) this.pending = safe + hold; return events; }
       this.addText(events, safe);
       this.pending = hold;
       return events;
@@ -177,16 +189,14 @@ export class StreamSieve {
     let rest = "";
     if (parsed.toolCalls.length > 0) {
       const consumedEnd = Math.max(lastMatchEnd(LOOSE_CLOSE, buffer), lastMatchEnd(DSML_CLOSE, buffer),
-        lastMatchEnd(BARE_WRAPPER_CLOSE, buffer));
+        lastMatchEnd(BARE_WRAPPER_CLOSE, buffer), lastMatchEnd(XML_INVOKE_CLOSE, buffer),
+        lastMatchEnd(RESULT_CLOSE, buffer));
       rest = consumedEnd > 0 ? buffer.slice(consumedEnd) : "";
       this.pushCommitted(events, parsed);
-    } else if (parsed.content.trim()) {
-      // Orphan close tags stay hidden; other closed prose is released.
-      if (!/^\s*<\/[^>]+>\s*$/.test(parsed.content)) this.addText(events, buffer);
+    } else if (parsed.content.trim() && !/^\s*<\/[^>]+>\s*$/.test(parsed.content)) {
+      this.addText(events, buffer); // orphan close tags stay hidden; other prose is released
     }
-    // Protocol-shaped garbage with no reparable call stays hidden; turn-end
-    // resolution owns the empty-fallback/retry decision.
-    // Hold a trailing partial tag fragment (no ">" yet) for the next chunk.
+    // Hold a partial tag fragment (no ">"); turn-end owns fallback/retry.
     if (rest && /^\s*<(?![\s\S]*>)/.test(rest)) {
       this.capture = rest;
       return events;
@@ -208,8 +218,7 @@ export class StreamSieve {
       if (rest) this.pending = rest;
       return events;
     }
-    // A leading JSON object that is not a protocol-only tool call: release it
-    // and stop considering stream-start braces as tool-call candidates.
+    // Non-tool leading JSON: release it and stop treating braces as candidates.
     this.resetCapture();
     this.pending = buffer;
     this.markReleased(head);
@@ -218,30 +227,22 @@ export class StreamSieve {
 
   private captureComplete(): boolean {
     const buffer = this.capture;
+    // Empty opener: commit on loose close only; unclosed recovered at flush.
+    if (/^<\s*>/.test(buffer)) return regexPresent(LOOSE_CLOSE, buffer);
     if (regexPresent(LOOSE_OPEN, buffer) && regexPresent(LOOSE_CLOSE, buffer)) return true;
     if (regexPresent(DSML_OPEN, buffer)) {
-      // Once a wrapper is open, only its matching wrapper close completes the
-      // capture; closing individual invokes must not commit the block early.
-      for (const name of ["calls", "tool_calls", "function_calls"]) {
-        const open = new RegExp(`<[｜]{1,2}DSML[｜]{1,2}[ \\t]*${name}\\b`, "i");
-        if (open.test(buffer)) {
-          const close = new RegExp(
-            `(?:</[｜]{1,2}DSML[｜]{1,2}[ \\t]*${name}\\b[^>]*>|<\\s*\\/\\s*${name}\\s*>)`, "i");
-          return close.test(buffer);
-        }
+      // Only the matching wrapper close commits; invoke closes must not.
+      for (const name of DSML_WRAPPER_NAME_LIST) {
+        if (dsmlPrefix(name).test(buffer)) return dsmlBlockClose(name).test(buffer);
       }
-      // No wrapper: a loose standalone invoke completes when it is closed.
-      return regexPresent(/<[｜]{1,2}DSML[｜]{1,2}[ \t]*invoke\b[^>]*>/i, buffer) &&
-        regexPresent(/<\/[｜]{1,2}DSML[｜]{1,2}[ \t]*invoke\b[^>]*>/i, buffer);
+      // A loose standalone invoke completes when it is closed.
+      return regexPresent(DSML_INVOKE_OPEN, buffer) && regexPresent(DSML_INVOKE_CLOSE, buffer);
     }
+    if (regexPresent(XML_INVOKE_OPEN, buffer)) return regexPresent(XML_INVOKE_CLOSE, buffer);
+    if (regexPresent(RESULT_OPEN, buffer)) return regexPresent(RESULT_CLOSE, buffer);
     if (regexPresent(BARE_WRAPPER_OPEN, buffer)) {
-      if (regexPresent(BARE_WRAPPER_CLOSE, buffer)) return true;
-      // A DSML-form wrapper close may survive an ASCII-mangled opener.
-      if (regexPresent(
-        /<\/[｜]{1,2}DSML[｜]{1,2}[ \t]*(calls|tool_calls|function_calls)\b[^>]*>/i, buffer)) return true;
-      // Fully-mangled wrapper with no reliable close: settle once an invoke closes.
-      return regexPresent(DSML_OPEN, buffer) &&
-        regexPresent(/<\/[｜]{1,2}DSML[｜]{1,2}[ \t]*invoke\b[^>]*>/i, buffer);
+      if (regexPresent(BARE_WRAPPER_CLOSE, buffer) || regexPresent(DSML_WRAPPER_CLOSE, buffer)) return true;
+      return regexPresent(DSML_OPEN, buffer) && regexPresent(DSML_INVOKE_CLOSE, buffer);
     }
     // A continued orphan wrapper closer from a held rest completes capture.
     return regexPresent(DSML_CLOSE, buffer) && !regexPresent(LOOSE_OPEN, buffer) &&
@@ -289,10 +290,11 @@ export class StreamSieve {
     const lastLt = text.lastIndexOf("<");
     if (lastLt < 0) return [text, ""];
     const tail = text.slice(lastLt);
-    return couldStartTag(tail) ? [text.slice(0, lastLt), tail] : [text, ""];
+    if (couldStartTag(tail) || /^<\s*>$/.test(tail)) return [text.slice(0, lastLt), tail];
+    return [text, ""];
   }
 
-  private markReleased(text: string): void { if (/\S/.test(text)) this.nonWhitespaceReleased = true; }
+  private markReleased(text: string): void { if (/[^\s,]/.test(text)) this.nonWhitespaceReleased = true; }
 
   private resetCapture(): void { this.capture = ""; this.captureKind = null; }
 }

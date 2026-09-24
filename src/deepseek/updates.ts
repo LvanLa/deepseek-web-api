@@ -1,4 +1,5 @@
 /** Converts DeepSeek patch variants into stable reasoning/output update events. */
+import { HttpError } from "../utils/errors.js";
 import { isRecord } from "../utils/json.js";
 import type { DeepSeekFragment, DeepSeekSseEvent } from "./types.js";
 import { iterDeepSeekSse } from "./sse.js";
@@ -43,13 +44,19 @@ function readyUpdate(event: DeepSeekSseEvent): DeepSeekUpdate {
   };
 }
 
+export type RawFrameSink = (entry: { event: string | null; raw: string }) => void;
+
 /**
  * Track the active fragment type so content-only APPEND patches stay in the correct channel.
  * This is what prevents reasoning text from leaking into final output text.
  */
-export async function* iterDeepSeekUpdates(response: Response): AsyncGenerator<DeepSeekUpdate> {
+export async function* iterDeepSeekUpdates(
+  response: Response,
+  onRawFrame?: RawFrameSink,
+): AsyncGenerator<DeepSeekUpdate> {
   let current: "reasoning" | "output" = "reasoning";
   for await (const event of iterDeepSeekSse(response)) {
+    onRawFrame?.({ event: event.event, raw: event.raw ?? JSON.stringify(event.data) ?? "" });
     const { data } = event;
     if (event.event === "ready") {
       yield readyUpdate(event);
@@ -58,6 +65,17 @@ export async function* iterDeepSeekUpdates(response: Response): AsyncGenerator<D
     if (event.event === "title") {
       if (typeof data.content === "string") yield { type: "title", title: data.content };
       continue;
+    }
+    // Upstream failures still arrive with HTTP 200; surface the real message
+    // instead of ending empty, which would burn the automatic recovery retry.
+    if (isContextLengthFrame(data)) {
+      // Marked so the client can fork to a fresh session and retry once.
+      throw new HttpError(
+        502, `DeepSeek upstream error: ${upstreamErrorMessage(data)}`, "context_length_exceeded",
+      );
+    }
+    if (isUpstreamError(event, data)) {
+      throw new HttpError(502, `DeepSeek upstream error: ${upstreamErrorMessage(data)}`);
     }
     if (event.event === "close") {
       yield { type: "close" };
@@ -105,4 +123,37 @@ export async function* iterDeepSeekUpdates(response: Response): AsyncGenerator<D
       }
     }
   }
+}
+
+/** True for an explicit or text-signaled context-length failure frame. */
+function isContextLengthFrame(data: Record<string, unknown>): boolean {
+  if (data.finish_reason === "context_length_exceeded") return true;
+  const text = [data.content, data.message, data.msg].filter((v) => typeof v === "string").join(" ");
+  return /context[ _-]?length|context_length|对话长度|长度上限|开启新对话/i.test(text);
+}
+
+/** Recognize the error shapes DeepSeek sends inside an otherwise 200 SSE stream. */
+function isUpstreamError(event: DeepSeekSseEvent, data: Record<string, unknown>): boolean {
+  if (event.event === "error" || data.type === "error" || data.o === "ERROR") return true;
+  if (isRecord(data.error)) return true;
+  return typeof data.code === "number" && data.code !== 0 &&
+    (typeof data.message === "string" || typeof data.msg === "string");
+}
+
+/** Pull the human-readable message out of the known error payload variants. */
+function upstreamErrorMessage(data: Record<string, unknown>): string {
+  const candidates: unknown[] = [data.message, data.msg, data.content, data.error];
+  if (isRecord(data.v)) candidates.push(data.v.message, data.v.msg, data.v.error, data.v.errmsg);
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+    if (isRecord(candidate) && typeof candidate.message === "string" && candidate.message) {
+      return candidate.message;
+    }
+  }
+  return JSON.stringify(data).slice(0, 300);
+}
+
+/** Whether a caught failure is a marked context-length upstream error. */
+export function isContextLengthExceeded(error: unknown): boolean {
+  return error instanceof HttpError && error.code === "context_length_exceeded";
 }

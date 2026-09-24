@@ -44,4 +44,6 @@ export interface DeepSeekFragment {
 export interface DeepSeekSseEvent {
   event: string | null;
   data: Record<string, unknown>;
+  /** Raw SSE data text; used to trace frames that produce no recognized update. */
+  raw?: string;
 }

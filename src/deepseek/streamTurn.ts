@@ -31,6 +31,7 @@ export interface StreamTurnResult {
   framesEmitted: number;
   title: string | null;
   tokens: number;
+  upstreamTrace: string[];
 }
 
 /**
@@ -52,6 +53,12 @@ export async function streamToolTurn(input: StreamTurnInput): Promise<StreamTurn
   let framesEmitted = 0;
   let committed = false;
   const committedCalls: OpenAIToolCall[] = [];
+  // Last raw frames explain an empty turn (silent rejection, unknown patch).
+  const trace: string[] = [];
+  const rememberFrame = (entry: { event: string | null; raw: string }): void => {
+    trace.push(`event=${entry.event ?? "-"} ${entry.raw.slice(0, 200)}`);
+    if (trace.length > 6) trace.shift();
+  };
 
   const emitReasoning = (delta: string): void => {
     if (!delta) return;
@@ -86,7 +93,7 @@ export async function streamToolTurn(input: StreamTurnInput): Promise<StreamTurn
     }
   };
 
-  for await (const update of iterDeepSeekUpdates(input.upstream)) {
+  for await (const update of iterDeepSeekUpdates(input.upstream, rememberFrame)) {
     if (update.type === "ready") {
       responseMessageId = update.responseMessageId ?? responseMessageId;
       requestMessageId = update.requestMessageId ?? requestMessageId;
@@ -107,11 +114,13 @@ export async function streamToolTurn(input: StreamTurnInput): Promise<StreamTurn
       }
     } else if (update.type === "output" && update.delta) {
       responseText += update.delta;
-      if (!committed) forwardOutputEvents(outputSieve.feed(update.delta));
+      // Keep feeding after commit: prose is dropped below but later bare
+      // objects (parallel-call turns) must still reach the sieve.
+      forwardOutputEvents(outputSieve.feed(update.delta));
     }
   }
 
-  if (!committed) forwardOutputEvents(outputSieve.flush());
+  forwardOutputEvents(outputSieve.flush());
 
   const outcome = resolveToolTurn(
     responseText,
@@ -148,5 +157,6 @@ export async function streamToolTurn(input: StreamTurnInput): Promise<StreamTurn
     framesEmitted,
     title,
     tokens,
+    upstreamTrace: trace,
   };
 }

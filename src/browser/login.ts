@@ -188,6 +188,13 @@ export class LoginManager {
     return loadAuth(this.config.authFile);
   }
 
+  /** Forget cached state and validate login again, opening a browser when required. */
+  async refreshLogin(): Promise<DeepSeekAuth> {
+    this.cachedAuth = null;
+    this.hydrated = false;
+    return this.ensureLoggedIn();
+  }
+
   /** Headless page for PoW; injects auth.json so empty profiles still work. */
   async page(): Promise<Page> {
     const page = await this.chrome.deepSeekPage({
@@ -203,7 +210,7 @@ export class LoginManager {
   private async hydrate(page: Page, auth: DeepSeekAuth): Promise<void> {
     if (this.hydrated && this.chrome.isConnected()) {
       const existing = await readUserToken(page);
-      if (existing) return;
+      if (existing === auth.token) return;
     }
     const context = await this.chrome.context();
     const cookies = cookiesForContext(auth, this.config.baseUrl);

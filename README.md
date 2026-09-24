@@ -23,6 +23,7 @@
 - `RESPONSE` → Responses output text / Chat content
 - API key 保护全部 `/v1/*` 路由
 - DeepSeek session 与 `parent_message_id` 持久化；保存完整展开历史并按折叠指纹匹配，切换 flash/pro 或 thinking、工具轮之后都不主动分叉
+- 客户端用滑动窗口回放（只发最近若干轮、丢弃更早的轮次）导致历史匹配失败时，按请求指令的哈希粘回该指令下最近的 session：同一次 agent 会话始终落在同一个 DeepSeek 对话里；全新任务指令文本不同，不会误粘
 - system/developer/AGENTS/skills、工具 schema、assistant/tool 历史的 prompt 兼容
 - 文本工具协议 → Chat `tool_calls` / Responses `function_call`；容忍真实模型输出的松散标签、DSML 包装和转义错误的 Windows 路径
 - Pi `openai-completions` 与 `openai-responses` 配置示例
@@ -195,11 +196,22 @@ DeepSeek Web 没有 OpenAI 原生 function calling。本项目把 tools/function
 真实模型输出经常偏离上面的严格格式，解析器会做窄范围恢复，且不会把普通正文误判为调用：
 
 - 接受松散的 ASCII 标签（`tool_call`、`tool-call`、`_call`、`call` 等）和原生 DSML 包装（`<｜｜DSML｜｜ invoke/parameter>`，全角竖线一到两根）。
+- 纯 XML 形态（call + invoke + parameter 三层标签、无全角竖线、载荷不是 JSON 时）同样逐个恢复，标签在流式中隐藏；无 name 的 invoke 和没有 invoke 归属的孤立 parameter 不会被猜成调用。
+- DSML 竖线与关键字之间是不间断空格（NBSP）、全角空格等 Unicode 空白时同样识别；相邻两个 DSML 包装之间的纯空白间隙在流式中静默隐藏，不会把协议原文或空白噪声帧下发给客户端。
+- 包装标签不配对时（`<tool_call>` 开了没关、DSML invoke 没有 wrapper 开头却以 `</...calls>` 收尾）仍逐个恢复调用，孤立的关闭标签残差按协议垃圾隐藏；`</3` 这类散文片段不会被误吞。
+- 开标签名漂移到 THINK、只留下 `<> ` 开头时，只要后面的工具 JSON 和闭合标签完整，仍按畸形开标签恢复，`<> ` 不会下发。
 - 模型省略 `name`、只给出 `{"arguments":{...}}` 时，用注册工具的 `paramKeys` 唯一匹配推断工具名；两个工具都能解释全部参数时不猜。
-- 严格解析失败且字符串含盘符前缀（如 `f:\workspace\...`）时，按 Windows 单反斜杠转义错误重试一次，修复后被丢弃的调用可以正常恢复。
+- 严格解析失败且字符串含盘符前缀（如 `f:\workspace\...`）时，按 Windows 单反斜杠转义错误重试一次，修复后被丢弃的调用可以正常恢复。即使严格解析"成功"也会消歧：路径字符串里的 `\t`、`\b`、`\f`、`\r`、`\n` 会被 JSON 当成合法转义（如 `d:\tmp` 被静默改成制表符），此时只在**含盘符前缀的字符串内**把这些转义还原为字面反斜杠；不含盘符的字符串（如 `"a\tb"`）不受影响。
+- 模型用 `"tool"` 字段（而非 `"name"`）写工具名时同样识别；DSML wrapper 开标签后直接放裸 JSON、invoke 开标签整个丢失（闭合标签依次错位为 parameter、invoke、calls）时，裸 JSON 仍恢复为调用，wrapper 整体隐藏；wrapper 内含正常 invoke 时不做此恢复。
+- 仍失败时，对字符串里未转义的双引号（`python -c "..."` 命令、Write 的 `content` 内嵌 Python 三引号源码等）做最后手段的结构化解析：枚举引号的所有候选收尾并回溯，只接受能从 `{` 完整消费整段的解析；多个解析都成立时保留结构最多、不把 JSON 坍缩进字符串的那个；`{not json}` 这类非 JSON 不会被猜成调用。
 - 流式过程中跨 chunk 的标签、孤立闭合标签和残缺 DSML 片段会被隐藏，不会以原始协议文本下发给客户端。
+- 一个回合连续输出多个 bare 对象（空格或逗号分隔、同一行也可以，无论在 RESPONSE 通道还是漏进 THINK）都会逐个恢复并分配连续 index；对象之间的空白/逗号作为协议残差隐藏，散文夹在中间时不会跨过正文误收。
+- 模型把 agent 客户端自己的工具结果包装（`<tool_call_result>`、`<toolcall_status>`、`<command_id>`、`<command_status>`、`<command_run_logs>` 等）整段当成回答吐出时，包装块（含未闭合的残缺块、丢失外层包装的内部标签）在流式中整段隐藏，并按空响应规则切新会话/压缩重试一次；块前的正常散文照常下发，普通 `<result>` 元素不会被误判。
+- 上游在 SSE 内部返回错误帧（HTTP 仍是 200：`event: error`、`o:"ERROR"`、非零 `code` 或嵌套 `error` 记录，常见于内容风控、会话失效）时，返回 502 并带上 DeepSeek 的原始报错信息，不会被当成"空响应"消耗掉那一次自动重试。其中**上下文超限错误帧**（`finish_reason:"context_length_exceeded"` 或"达到对话长度上限/请开启新对话"文案）不会直接报错，而是按下方空响应的规则自动切新会话（非复用会话则原地压缩）重试一次；重试仍超限时才返回 502。
+- 上游静默返回空 SSE（没有错误帧）且当前会话是复用会话时（常见于 agent 长会话累积历史超出网页端上下文：网页版上下文小于官方 API 的 128K），自动重试会切到**全新 DeepSeek 会话**并用压缩版 prompt 重发，而不是继续打向已膨胀的会话；非复用会话的空响应仍在当前会话内重试。Chat、Responses 两条链路以及无工具的普通请求都适用。相关日志附带 `upstreamTrace`（上游最后 6 个原始帧）便于事后取证，prompt 超过 13 万字符时会提前打 WARN 预警。
+- prepare 阶段（PoW 挑战或会话创建）被上游以 `code:40003`、"Authorization Failed (invalid token)" 拒绝时（常见于服务长期运行期间登录态过期），自动清空缓存认证并重新校验登录（`data/auth.json` 仍有效则静默恢复，否则打开浏览器等待重新登录），随后用新登录态重新 prepare 并重放同一请求，仅重试一次；刷新后仍 40003 时才把鉴权错误返回给客户端。
 
-这仍是**提示词模拟**：不能保证模型一定调用工具、严格遵守 JSON Schema 或正确并行调用。带工具的流式请求可能在尾部集中输出结构化 call，因为服务必须先清理协议文本。
+这仍是**提示词模拟**：不能保证模型一定调用工具或严格遵守 JSON Schema。带工具的流式请求可能在尾部集中输出结构化 call，因为服务必须先清理协议文本。
 
 ## 环境变量
 

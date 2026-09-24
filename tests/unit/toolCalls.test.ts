@@ -517,6 +517,68 @@ Done setup.`;
     expect(parseToolCalls(text, "seed", { tools }).toolCalls).toEqual([]);
   });
 
+  it("recovers a call behind an empty <> opener and an orphan close", () => {
+    const body = '{"name":"TodoWrite","arguments":{"merge":true,"todos":[]}}';
+    const result = parseToolCalls(`<>\n${body}\n</call>`, "seed", {
+      tools: [{ name: "TodoWrite", paramKeys: ["todos", "merge"] }],
+    });
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function).toEqual({
+      name: "TodoWrite",
+      arguments: '{"merge":true,"todos":[]}',
+    });
+  });
+
+  it("does not treat <> inside ordinary prose as an opener", () => {
+    const text = "SQL 里用 a <> b 做不等值比较。";
+    expect(parseToolCalls(text, "seed")).toEqual({ content: text, toolCalls: [] });
+  });
+
+  it("repairs unescaped double quotes inside a command string", () => {
+    const body = '{"name":"RunCommand","arguments":{"command":"python -c "print(\'ok\')"","blocking":true,' +
+      '"cwd":"f:\\workspace\\play-together"}}';
+    const result = parseToolCalls(`<tool_call>\n${body}\n</tool_call>`, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("RunCommand");
+    const args = JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}") as {
+      command: string; blocking: boolean; cwd: string;
+    };
+    expect(args.command).toBe("python -c \"print('ok')\"");
+    expect(args.blocking).toBe(true);
+    expect(args.cwd).toBe("f:\\workspace\\play-together");
+  });
+
+  it("does not greedily accept non-JSON or unclosed objects", () => {
+    expect(parseToolCalls("<tool_call>{not json}</tool_call>")).toEqual({
+      content: "<tool_call>{not json}</tool_call>",
+      toolCalls: [],
+    });
+    const unclosed = '<_call>\n{"name":"read","arguments":{"path":"README.md}\n</tool_call>';
+    expect(parseToolCalls(unclosed, "seed")).toEqual({ content: "", toolCalls: [] });
+  });
+
+  it("keeps separate keys when a string value embeds triple-quoted source", () => {
+    const embedded =
+      '"""主题包 + Planner 单元测试。\n' +
+      'THEME_FIELDS = {\n"theme_key", "festival", "title",\n}\n' +
+      'payload = json.loads(prompt.split("\\n", 1)[1])\n' +
+      'assert "base_missions" not in payload, "prompt 不能携带成稿任务"\n"';
+    const body = '{"name":"Write","arguments":{"file_path":"f:\\workspace\\play-together\\backend\\tests\\t.py",' +
+      `"content":"${embedded}"}}`;
+    const result = parseToolCalls(`<tool_call>\n${body}\n</tool_call>`, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("Write");
+    const args = JSON.parse(result.toolCalls[0]?.function.arguments ?? "{}") as {
+      file_path: string; content: string;
+    };
+    expect(Object.keys(args).sort()).toEqual(["content", "file_path"]);
+    expect(args.file_path).toBe("f:\\workspace\\play-together\\backend\\tests\\t.py");
+    expect(args.content).toBe(embedded);
+  });
+
   it("recovers orphan parameters missing invoke openers or shifted close tags", () => {
     const base = "f:\\workspace\\play-together\\miniprogram\\pages\\";
     const orphanInvokeClose = (file: string): string =>
@@ -578,5 +640,197 @@ Done setup.`;
       `${base}memories\\memories.ts`,
       `${base}memories\\memories.wxml`,
     ]);
+  });
+
+  it.each([
+    ["NBSP", " "],
+    ["ideographic space", "　"],
+  ])("tolerates %s between DSML bars and the keyword", (_label, gap) => {
+    const stanza = [
+      `<｜｜DSML｜｜${gap}calls>`,
+      `<｜｜DSML｜｜${gap}invoke name="LS">`,
+      `<｜｜DSML｜｜${gap}parameter name="path" string="true">src</｜｜DSML｜｜parameter>`,
+      `</｜｜DSML｜｜${gap}invoke>`,
+      `</｜｜DSML｜｜${gap}calls>`,
+    ].join("\n");
+    const result = parseToolCalls(stanza, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]!.function.name).toBe("LS");
+    expect(JSON.parse(result.toolCalls[0]!.function.arguments)).toEqual({ path: "src" });
+  });
+
+  it("parses two adjacent DSML wrappers with only whitespace between them", () => {
+    const one = (name: string, argName: string, value: string) => [
+      "<｜｜DSML｜｜ calls>",
+      `<｜｜DSML｜｜ invoke name="${name}">`,
+      `<｜｜DSML｜｜ parameter name="${argName}" string="true">${value}</｜｜DSML｜｜ parameter>`,
+      "</｜｜DSML｜｜ invoke>",
+      "</｜｜DSML｜｜ calls>",
+    ].join("\n");
+    const result = parseToolCalls(`${one("LS", "path", "src")}    ${one("Read", "file", "a.ts")}`, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls.map((call) => call.function.name)).toEqual(["LS", "Read"]);
+  });
+});
+
+describe("harness tool-result protocol", () => {
+  const block = `<tool_call_result>
+<toolcall_status>Done</toolcall_status>
+<command_id>job-7c9a</command_id>
+<command_status>Exited</command_status>
+<command_run_logs>81 passed in 2.51s</command_run_logs>
+</tool_call_result>`;
+
+  it("hides a complete tool-result block as protocol-only", () => {
+    expect(parseToolCalls(block)).toEqual({ content: "", toolCalls: [] });
+  });
+
+  it("hides a result block whose close tag never arrived", () => {
+    expect(parseToolCalls(block.replace("</tool_call_result>", ""))).toEqual({ content: "", toolCalls: [] });
+  });
+
+  it("hides stranded inner harness tags without a wrapper", () => {
+    const stray = "<command_id>job-1</command_id><command_status>Exited</command_status>";
+    expect(parseToolCalls(stray)).toEqual({ content: "", toolCalls: [] });
+  });
+
+  it("keeps prose that precedes the result block", () => {
+    expect(parseToolCalls(`Done.\n${block}`).content).toBe("Done.");
+  });
+
+  it("does not treat a bare result element as protocol", () => {
+    const text = "<result>42</result>";
+    expect(parseToolCalls(text)).toEqual({ content: text, toolCalls: [] });
+  });
+});
+
+describe("tool key and malformed DSML recovery", () => {
+  const winPath = String.raw`d:\tmp\tijian`;
+  const lsBlock = `<_call>\n{"tool": "LS", "arguments": {"path": "${winPath}"}}\n</_call>`;
+  const grepWrapper = `<｜｜DSML｜｜ calls>\n` +
+    `{"tool": "Grep", "arguments": {"pattern": "M6", "path": "${winPath}", ` +
+    `"output_mode": "files_with_matches"}}\n` +
+    `</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>`;
+
+  it("recovers a call that names the tool with the tool key", () => {
+    const result = parseToolCalls(lsBlock);
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("LS");
+    expect(result.toolCalls[0]?.function.arguments).toBe(
+      JSON.stringify({ path: winPath }),
+    );
+  });
+
+  it("recovers bare JSON from a malformed DSML wrapper with shifted closes", () => {
+    const result = parseToolCalls(grepWrapper);
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("Grep");
+    expect(JSON.parse(result.toolCalls[0]!.function.arguments)).toMatchObject({
+      pattern: "M6", output_mode: "files_with_matches",
+    });
+  });
+
+  it("recovers both calls from the combined malformed turn", () => {
+    const result = parseToolCalls(`${lsBlock}\n${grepWrapper}`);
+    expect(result.content).toBe("");
+    expect(result.toolCalls.map((call) => call.function.name)).toEqual(["LS", "Grep"]);
+  });
+
+  it("keeps a tab escape inside a string without a drive prefix", () => {
+    const result = parseToolCalls('<tool_call>{"name":"echo","arguments":{"text":"a\\tb"}}</tool_call>');
+    expect(result.toolCalls[0]?.function.arguments).toBe(JSON.stringify({ text: "a\tb" }));
+  });
+});
+
+const PARALLEL_OBJECTS = [
+  '{"name":"read","arguments":{"path":"a.ts"}}',
+  '{"name":"bash","arguments":{"command":"ls"}}',
+  '{"name":"Grep","arguments":{"pattern":"x"}}',
+];
+
+describe("parseToolCalls multiple same-line bare objects", () => {
+  it.each([
+    ["space", " "],
+    ["comma", ","],
+    ["comma-space", ", "],
+  ])("recovers three %s-separated bare objects", (_label, sep) => {
+    const result = parseToolCalls(PARALLEL_OBJECTS.join(sep), "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls.map((call) => call.function)).toEqual([
+      { name: "read", arguments: '{"path":"a.ts"}' },
+      { name: "bash", arguments: '{"command":"ls"}' },
+      { name: "Grep", arguments: '{"pattern":"x"}' },
+    ]);
+  });
+
+  it("recovers space-separated objects inside one tool-call tag", () => {
+    const result = parseToolCalls(`<tool_call>${PARALLEL_OBJECTS.join(" ")}</tool_call>`, "seed");
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(3);
+  });
+
+  it("does not bridge a second object across prose on the same line", () => {
+    const text = `${PARALLEL_OBJECTS[0]} then ${PARALLEL_OBJECTS[1]}`;
+    const result = parseToolCalls(text, "seed");
+    expect(result.toolCalls).toEqual([]);
+    expect(result.content).toBe(text);
+  });
+
+  it("does not treat prose followed by a comma and an object as a bare turn", () => {
+    const text = `see, ${PARALLEL_OBJECTS[0]}`;
+    const result = parseToolCalls(text, "seed");
+    expect(result.toolCalls).toEqual([]);
+    expect(result.content).toBe(text);
+  });
+});
+
+describe("parseToolCalls plain-XML invoke protocol", () => {
+  const open = (tag: string, attrs = ""): string => "<" + tag + attrs + ">";
+  const close = (tag: string): string => "</" + tag + ">";
+  const param = (name: string, body: string, attrs = ""): string =>
+    open("parameter", ` name="${name}"${attrs}`) + body + close("parameter");
+  const wrapped = (body: string): string => open("call") + " " + body + " " + close("call");
+
+  it("recovers the user's call/invoke/parameter stanza with raw string values", () => {
+    const filePath = "c:\\Users\\研发部\\.trae-cn\\plugins\\lark\\1.0.5\\lark-base-workflow-schema.md";
+    const body = open("invoke", ' name="Read"') + " " + param("file_path", filePath) + close("invoke");
+    const result = parseToolCalls(wrapped(body));
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("Read");
+    expect(result.toolCalls[0]?.function.arguments).toBe(JSON.stringify({ file_path: filePath }));
+  });
+
+  it("parses a standalone invoke without a call wrapper, honoring typed values", () => {
+    const typed =
+      param("line", "42", ' string="false"') + param("tags", '["a","b"]') + param("note", "x &amp; y", ' string="true"');
+    const result = parseToolCalls(open("invoke", ' name="Edit"') + typed + close("invoke"));
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.arguments).toBe(
+      JSON.stringify({ line: 42, note: "x & y", tags: ["a", "b"] }),
+    );
+  });
+
+  it("recovers an unclosed invoke at turn end", () => {
+    const text = open("call") + open("invoke", ' name="Read"') + param("file", "f:\\workspace\\x.md");
+    const result = parseToolCalls(text);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0]?.function.name).toBe("Read");
+    expect(result.content).toBe("");
+  });
+
+  it("does not fabricate calls from nameless invokes or stranded parameters", () => {
+    expect(parseToolCalls(open("invoke") + param("x", "v") + close("invoke")).toolCalls).toEqual([]);
+    const stranded = param("x", "v");
+    expect(parseToolCalls(stranded)).toEqual({ content: stranded, toolCalls: [] });
+  });
+
+  it("leaves ordinary prose untouched", () => {
+    const text = "please call support, numbers like a < b stay prose";
+    expect(parseToolCalls(text)).toEqual({ content: text, toolCalls: [] });
   });
 });
